@@ -1,0 +1,262 @@
+---
+title: "vehicles_EDA"
+author: "Dominika Lukasakova"
+date: "2026-04-10"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Introduction
+
+Vehicles dataset EDA\
+Source: <https://fueleconomy.gov/feg/ws/index.shtml>
+
+Based on the column descriptions, we could potentially predict fuel consumption (MPG).
+
+-   **MPG (Miles per gallon)** – a measure of fuel economy in automobiles\
+-   **Target variable:** `comb08`
+
+```{r}
+library(tidyverse)
+library(ggcorrplot)
+
+rm(list = ls())
+data <- read_csv("C:/Users/domil/Downloads/vehicles.csv")
+data
+View(data)
+```
+
+## Basic Structure
+
+First, we check dataset dimensions and data types.
+
+```{r}
+dim(data)
+```
+
+The dataset has 49,846 rows and 84 columns.
+
+```{r}
+glimpse(data)
+```
+
+```{r}
+data %>%
+  summarise(across(everything(), class))
+```
+
+The dataset contains columns of type: character, double, logical. Columns createdOn and modifiedOn are dates stored as strings. The dataset has some missing values.
+
+## Missing Values
+
+```{r}
+sum(is.na(data))
+```
+
+The dataset contains 538 466 missing values.
+
+# Identify columns with missing values
+
+```{r}
+missing_summary <- data %>%
+  summarise(across(everything(), ~mean(is.na(.)))) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "missing_pct") %>%
+  arrange(desc(missing_pct))
+
+missing_summary %>%
+  print(n = 84)
+```
+
+Columns with more than 60% missing values:
+
+-   `c240bDscr`, `c240Dscr`, `sCharger`, `rangeA`, `fuelType2`, `guzzler`, `evMotor`,
+-   `atvType`, `tCharger`, `trans_dscr`, `startStop`, `mfrCode`
+
+We will not use these columns and remove them later.
+
+-   Column `eng_dscr` has \~37% missing values
+-   Columns `cylinders`, `displ`, `drive`, `trany`, `fuelType1` contain only a small amount of missing data (up to \~3%), so they could potentially be imputed.
+
+## Unique Values
+
+Next we identify columns with unique values.
+
+```{r}
+data %>%
+  summarise(across(everything(), n_distinct)) %>%
+  pivot_longer(everything(), 
+               names_to = "variable", 
+               values_to = "n_unique") %>%
+  arrange(desc(n_unique)) %>%
+  print(n = 84)
+```
+
+From these we filter out non-informative columns. We remove variables with nearly all unique values, as they act as identifiers and do not provide generalizable patterns for prediction. Also variables with very low variability (binary or near-constant features) were excluded, as they provide minimal information for explaining variation in the target variable.
+
+```{r}
+data %>%
+  summarise(across(everything(), n_distinct)) %>%
+  pivot_longer(everything(), 
+               names_to = "variable", 
+               values_to = "n_unique") %>%
+  arrange(desc(n_unique)) %>%
+  filter(!(n_unique >= 0.9 * nrow(data))) %>%
+  filter(!(n_unique <= 2)) %>%
+  print(n = 84)
+```
+
+-   We should also remove `model` column, because its extremely high number of unique values makes it impractical for modeling, and `engId,` as it also represents an identifier.
+-   The dataset contains a large number of variables with high cardinality, indicating a high-dimensional feature space that requires careful feature selection.
+
+## Numerical Variables
+
+First, we check the distribution of numerical variables.
+
+```{r}
+num_data <- data %>% 
+  select(where(is.numeric)) %>% 
+  select(-id, -engId)
+
+summary(num_data)
+```
+
+-   Many columns have median = 0 because most vehicles do not have that feature, for example `highwayE` applies only to electric vehicles. So, these variables might be informative for specific subsets, but not for the general fuel consumption prediction.
+
+-   Some columns have min and median = -1, which is unusual and likely represents missing values. The columns are: `co2`, `co2A`, `feScore`, `ghgScore`, `ghgScoreA`.
+
+-   Although column `youSaveSpend` does not have issues in terms of distribution, its definition reveals that it is directly derived from fuel consumption and fuel cost variables. As a result, it contains information closely related to the target variable and could introduce data leakage and artificially inflating model performance.
+
+For further analysis we will remove: - columns with median = 0 or -1 - column `youSaveSpend`
+
+```{r}
+num_data <- num_data %>%
+  select(where(~ {
+    med <- median(., na.rm = TRUE)
+    !(med == 0 | med == -1)
+  })) %>%
+  select(-youSaveSpend)
+
+summary(num_data)
+```
+
+-   We are left with 11 numerical columns.
+
+-   The similarity between mean and median values suggests that most variables are not heavily skewed, although there might be some outliers.
+
+```{r}
+num_data %>%
+  pivot_longer(cols = everything(),
+               names_to = "variable",
+               values_to = "value") %>%
+  ggplot(aes(x = value)) +
+  geom_histogram(bins = 30, fill = "steelblue", color = "white") +
+  facet_wrap(~variable, scales = "free") +
+  theme_minimal()
+# A warning is displayed because of NA in columns cylinders and displ
+```
+
+TODO: zhodnotenie
+
+```{r}
+num_data %>%
+  pivot_longer(cols = everything(),
+               names_to = "variable",
+               values_to = "value") %>%
+  ggplot(aes(x = variable, y = value)) +
+  geom_boxplot() +
+  coord_flip() +
+  theme_minimal()
+# A warning is displayed because of NA in columns cylinders and displ
+```
+
+-   We can see that the `fuelCost08` and `co2TailpipeGpm` columns have outliers.
+-   The `year`column is spread from 1984 to 2026, so there are no outliers.
+
+We will plot another boxplot without columns `year`, `fuelCost08`, and `co2TailpipeGpm` due to differences in scale:
+
+```{r}
+num_data %>%
+  select(-year, -fuelCost08, -co2TailpipeGpm) %>%
+  pivot_longer(cols = everything(),
+               names_to = "variable",
+               values_to = "value") %>%
+  ggplot(aes(x = variable, y = value)) +
+  geom_boxplot() +
+  coord_flip() +
+  theme_minimal()
+# A warning is displayed because of NA in columns cylinders and displ
+```
+
+-   All columns have a significant amount of outsiders on the right side.
+
+We will plot another boxplot just with columns `displ` and `cylinders`:
+
+```{r}
+num_data %>%
+  select(displ, cylinders) %>%
+  pivot_longer(cols = everything(),
+               names_to = "variable",
+               values_to = "value") %>%
+  ggplot(aes(x = variable, y = value)) +
+  geom_boxplot() +
+  coord_flip() +
+  theme_minimal()
+```
+
+-   Both columns have outsiders on the right side.
+
+TODO: zhodnotenie
+
+## Correlation Analysis
+
+```{r}
+cor_matrix <- num_data %>%
+  select(where(is.numeric)) %>%
+  cor(use = "pairwise.complete.obs")
+
+cor_matrix
+ggcorrplot(cor_matrix)
+```
+
+-   Target `comb08` is highly positively correlated with:
+
+    -   `city08`, `highway08`, `UCity`, `UHighway` (up to \~0.996), so the usage of these columns in a model would cause data leakage
+
+-   Target `comb08` is strongly negatively correlated with:
+
+    -   `barrels08`, `co2TailpipeGpm`, `cylinders`, `displ`, `fuelCost08` (up to \~ -0.7)
+    -   however we know from the columns description that columns `barrels08`, `co2TailpipeGpm` and `fuelCost08` are derived from fuel consumption, so they would also cause data leakage
+    -   `cylinders` and `displ` are suitable predictors but they are highly correlated with each other (\~0.91)
+
+So, for the model, we will keep only column **`displ`**, because it has fewer missing values and a stronger correlation with target (\~ -0.71), and column `year`, because it has a moderate positive correlation (\~0.32) with target and has almost no correlation with `displ`.
+
+## Categorical Variables
+
+```{r}
+cat_data <- data %>% 
+  select(where(is.character))
+
+dim(cat_data)
+
+names(cat_data)
+```
+
+The dataset has 23 categorical variables. Based on the description of each columns, we will further explore the `fuelType`, ... and .. columns.
+
+```{r}
+data %>%
+  count(fuelType, sort = TRUE)
+```
+
+The `fuelType` variable shows a highly imbalanced distribution, with a few dominant categories (Regular and Premium gasoline) accounting for most observations, while several alternative fuel types appear only rarely. We will group rare categories of the fuelType variable into an "Other" class.
+
+```{r}
+ggplot(data, aes(x = fuelType, y = comb08)) +
+  geom_boxplot() +
+  coord_flip()
+```
+
+The boxplot shows how different fuel type influences fuel consumption. We can see that the electricity type has higher values then gasoline types.
