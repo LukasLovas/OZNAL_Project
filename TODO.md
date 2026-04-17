@@ -1,5 +1,4 @@
 TODO:
-- dokoncit EDA
 - preprocessing dat (vybrat najlepsie slpce) - Lukas
 - rozdelenie datasetov na train/test split - Lukas
 - uloha 2 (parametricke - Lukas, neparametricke - Dominika)

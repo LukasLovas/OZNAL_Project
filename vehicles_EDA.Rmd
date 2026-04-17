@@ -1,6 +1,6 @@
 ---
-title: "vehicles_EDA"
-author: "Dominika Lukasakova"
+title: "Vehicles dataset"
+author: "Dominika Lukašáková, Lukáš Lovás"
 date: "2026-04-10"
 output: html_document
 ---
@@ -9,19 +9,20 @@ output: html_document
 knitr::opts_chunk$set(echo = TRUE)
 ```
 
-## Introduction
+## EDA
 
-Vehicles dataset EDA\
+Vehicles dataset\
 Source: <https://fueleconomy.gov/feg/ws/index.shtml>
 
 Based on the column descriptions, we could potentially predict fuel consumption (MPG).
 
--   **MPG (Miles per gallon)** – a measure of fuel economy in automobiles\
+-   **MPG (Miles per gallon)** – a measure of fuel economy in automobiles, higher number= higher efficiency\
 -   **Target variable:** `comb08`
 
 ```{r}
 library(tidyverse)
 library(ggcorrplot)
+library(patchwork)
 
 rm(list = ls())
 data <- read_csv("C:/Users/domil/Downloads/vehicles.csv")
@@ -158,7 +159,11 @@ num_data %>%
 # A warning is displayed because of NA in columns cylinders and displ
 ```
 
-TODO: zhodnotenie
+Most variables show right-skewed distributions, with the majority of observations with lower values and with a long tail toward higher values.
+
+A few variables, such as `barrels08` and `co2TailpipeGpm` appear approximately normally distributed, though still with slight positive skew. In contrast, `cylinders` is a discrete variable, with clear peaks at common engine configurations - 4, 6, and 8 cylinders.
+
+The variable `year` shows a relatively even but slightly increasing distribution toward more recent years, indicating a higher representation of newer vehicles in the dataset.
 
 ```{r}
 num_data %>%
@@ -172,8 +177,9 @@ num_data %>%
 # A warning is displayed because of NA in columns cylinders and displ
 ```
 
--   We can see that the `fuelCost08` and `co2TailpipeGpm` columns have outliers.
--   The `year`column is spread from 1984 to 2026, so there are no outliers.
+-   The variable `fuelCost08` shows a wide IQR and numerous outliers.
+-   Column `co2TailpipeGpm` has a relatively compact central distribution but still includes several higher outliers.
+-   The `year`column has a narrow spread from 1984 to 2026, indicating that most observations are concentrated within a similar time range, so there are no outliers.
 
 We will plot another boxplot without columns `year`, `fuelCost08`, and `co2TailpipeGpm` due to differences in scale:
 
@@ -192,23 +198,11 @@ num_data %>%
 
 -   All columns have a significant amount of outsiders on the right side.
 
-We will plot another boxplot just with columns `displ` and `cylinders`:
+The boxplots reveal that most variables are right-skewed, as indicated by longer upper whiskers and a large number of high-value outliers. This pattern is especially clear for fuel economy variables (`city08`, `highway08`, `comb08`, `UCity`, `UHighway`), where a small number of highly efficient vehicles extend the upper range.
 
-```{r}
-num_data %>%
-  select(displ, cylinders) %>%
-  pivot_longer(cols = everything(),
-               names_to = "variable",
-               values_to = "value") %>%
-  ggplot(aes(x = variable, y = value)) +
-  geom_boxplot() +
-  coord_flip() +
-  theme_minimal()
-```
+Variables such as `barrels08` and `displ` exhibit moderate right skewness with some extreme values. In contrast, `cylinders` is a discrete variable, making its boxplot less informative and leading to apparent outliers due to limited possible values.
 
--   Both columns have outsiders on the right side.
-
-TODO: zhodnotenie
+Overall, the boxplots highlight skewness and the presence of outliers.
 
 ## Correlation Analysis
 
@@ -239,19 +233,50 @@ So, for the model, we will keep only column **`displ`**, because it has fewer mi
 cat_data <- data %>% 
   select(where(is.character))
 
-dim(cat_data)
+ncol(cat_data)
 
 names(cat_data)
 ```
 
-The dataset has 23 categorical variables. Based on the description of each columns, we will further explore the `fuelType`, ... and .. columns.
+The dataset has 23 categorical variables.
+
+```{r}
+cat_overview <- cat_data %>%
+  summarise(across(everything(), ~n_distinct(.))) %>%
+  pivot_longer(everything(),
+               names_to = "variable",
+               values_to = "n_levels")
+
+cat_overview
+```
+
+Based on the number of unique values and the description of each column, we will further explore only `fuelType`, `drive`, `VClass` and `trany` columns, because they have rational amount of categories and are related to fuel efficiency.
 
 ```{r}
 data %>%
-  count(fuelType, sort = TRUE)
+  select(fuelType, drive, VClass, trany) %>%
+  pivot_longer(everything(),
+               names_to = "variable",
+               values_to = "category") %>%
+  filter(!is.na(category)) %>%
+  group_by(variable, category) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  group_by(variable) %>%
+  slice_max(n, n = 10) %>%
+  ggplot(aes(x = reorder(category, n), y = n)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  facet_wrap(~variable, scales = "free") +
+  theme_minimal()
 ```
 
-The `fuelType` variable shows a highly imbalanced distribution, with a few dominant categories (Regular and Premium gasoline) accounting for most observations, while several alternative fuel types appear only rarely. We will group rare categories of the fuelType variable into an "Other" class.
+The `fuelType` variable shows a highly imbalanced distribution, with a few dominant categories (`Regular` and `Premium`) accounting for most observations, while several alternative fuel types appear only rarely. We will group rare categories of the fuelType variable into an "Other" class.
+
+The `drive` variable is moderately imbalanced. `Front-Wheel Drive` and `Rear-Wheel Drive` represent the majority of observations, while several four-wheel-drive variants and two-wheel-drive vehicles occur much less frequently. The presence of multiple related four-wheel-drive labels indicates potential redundancy in category definitions, so merging semantically similar categories could reduce noise.
+
+The `trany` variable contains many transmission categories, with a clear dominance of `Automatic 4-speed` and `Manual 5-speed` types.
+
+The VClass has 3 dominant categories - `Compact Cars`, `Midsize Cars`, and `Subcompact Cars`. The other catogories appear less frequently. Since vehicle class captures structural differences in size, it is expected to be an informative predictor and should be retained in the modeling stage.
 
 ```{r}
 ggplot(data, aes(x = fuelType, y = comb08)) +
@@ -260,3 +285,62 @@ ggplot(data, aes(x = fuelType, y = comb08)) +
 ```
 
 The boxplot shows how different fuel type influences fuel consumption. We can see that the electricity type has higher values then gasoline types.
+
+```{r}
+data %>%
+  filter(!is.na(drive)) %>%
+  ggplot(aes(x = drive, y = comb08)) +
+  geom_boxplot() +
+  coord_flip()
+```
+
+Drive type clearly affects fuel efficiency. `Front-Wheel Drive` vehicles tend to have higher combined MPG, while `4-Wheel or All-Wheel Drive` has smaller values.
+
+```{r}
+data %>%
+  filter(!is.na(VClass)) %>%
+  mutate(VClass = fct_lump(VClass, n = 10)) %>%
+  ggplot(aes(x = VClass, y = comb08)) +
+  geom_boxplot() +
+  coord_flip()
+```
+
+Vehicle class has a clear relationship with fuel efficiency. Smaller vehicles (`compact` and `subcompact cars`) tend to achieve higher MPG, while pickups, SUVs, and larger vehicles have smaller MPG values, so they are less fuel efficient.
+
+```{r}
+data %>%
+  filter(!is.na(trany)) %>%
+  mutate(trany = fct_lump(trany, n = 10)) %>%
+  ggplot(aes(x = trany, y = comb08)) +
+  geom_boxplot() +
+  coord_flip()
+```
+
+Transmission type strongly differentiates vehicle efficiency. `Automatic (A1)` shows the highest MPG values, while other categories have smaller values.
+
+## Tagret variable
+
+```{r}
+summary(data$comb08)
+```
+
+The target variable `comb08` (combined fuel efficiency) has strongly right-skewed distribution. Most vehicles have between 15 and 30 MPG, with a median value of 20 MPG. However, a long right tail is observed, extending up to 146 MPG.
+
+```{r}
+hist <- ggplot(data, aes(x = comb08)) +
+  geom_histogram(bins = 40, fill = "steelblue") +
+  theme_minimal()
+
+box <- ggplot(data, aes(y = comb08)) +
+  geom_boxplot(fill = "steelblue") +
+  coord_flip() +
+  theme_minimal()
+
+hist + box + plot_layout(ncol = 1, nrow = 2) 
+```
+
+Based on the histogram, we can say that the distribution is not normal. The boxplot confirms the presence of numerous high-value outliers. However, these observations are not errors but represent a distinct technological group of vehicles with significantly higher efficiency.
+
+```{r}
+#
+```
