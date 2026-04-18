@@ -7,6 +7,7 @@ output: html_document
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE)
+setwd("D:/Škola/Ing/2.semester/OZNAL_projekt")
 ```
 
 ## EDA
@@ -25,7 +26,7 @@ library(ggcorrplot)
 library(patchwork)
 
 rm(list = ls())
-data <- read_csv("C:/Users/domil/Downloads/vehicles.csv")
+data <- read_csv("data/vehicles.csv")
 data
 View(data)
 ```
@@ -341,6 +342,363 @@ hist + box + plot_layout(ncol = 1, nrow = 2)
 
 Based on the histogram, we can say that the distribution is not normal. The boxplot confirms the presence of numerous high-value outliers. However, these observations are not errors but represent a distinct technological group of vehicles with significantly higher efficiency.
 
-```{r}
-#
+## Preprocessing and Train/Test Split
+
+We now prepare the data for regression modeling. This section covers column selection, feature engineering, categorical simplification, sanity checks, train/test split, cross-validation folds, and a preprocessing recipe. No models are trained here.
+
+```{r message=FALSE, warning=FALSE}
+library(rsample)
+library(recipes)
+library(stringr)
+library(forcats)
 ```
+
+### Column Groups to Remove
+
+We define explicit groups of problematic columns, then combine them and use `any_of()` so the code does not fail if a column does not exist.
+
+#### Columns with Too Many Missing Values (`cols_missing`)
+
+These variables have more than 60% missing values and cannot be reliably used in a general model.
+
+```{r}
+cols_missing <- c(
+  "c240bDscr", "c240Dscr", "sCharger", "rangeA", "fuelType2",
+  "guzzler", "evMotor", "atvType", "tCharger", "trans_dscr",
+  "startStop", "mfrCode"
+)
+```
+
+#### Identifier Columns (`cols_ids`)
+
+These variables are identifiers or overly specific strings. Using them would encourage the model to memorize specific vehicles or model lines instead of learning generalizable patterns.
+
+```{r}
+cols_ids <- c("id", "engId", "model")
+```
+
+#### Data Leakage Columns (`cols_leakage`)
+
+These variables are either directly equivalent to `comb08` or derived from the same fuel consumption, emissions, or cost calculations. Including them would incorrectly inflate model performance.
+
+```{r}
+cols_leakage <- c(
+  "city08", "highway08", "UCity", "UHighway",
+  "barrels08", "co2TailpipeGpm", "fuelCost08", "youSaveSpend",
+  "comb08U", "city08U", "highway08U",
+  "combA08", "cityA08", "highwayA08",
+  "combA08U", "cityA08U", "highwayA08U",
+  "co2", "co2A", "co2TailpipeAGpm",
+  "feScore", "ghgScore", "ghgScoreA",
+  "phevCity", "phevHwy", "phevComb",
+  "combE", "cityE", "highwayE",
+  "combinedCD", "combinedUF",
+  "cityCD", "cityUF",
+  "highwayCD", "highwayUF"
+)
+```
+
+#### Sparse or Invalid Columns
+
+As identified in the EDA, many numeric columns have median = 0 or contain encoded missing values (−1). These are typically relevant only for electric or hybrid vehicles. Including them in the general regression dataset would introduce large numbers of zeros, encoded missing values, or derived information. They could be useful for targeted analyses of EV or PHEV subsets, but are excluded from the baseline model.
+
+```{r}
+cols_sparse_or_invalid <- c(
+  "barrelsA08", "charge120", "charge240", "charge240b",
+  "city08U", "cityA08", "cityA08U", "cityCD", "cityE", "cityUF",
+  "co2", "co2A", "co2TailpipeAGpm",
+  "comb08U", "combA08", "combA08U", "combE",
+  "combinedCD", "combinedUF",
+  "feScore", "fuelCostA08", "ghgScore", "ghgScoreA",
+  "highway08U", "highwayA08", "highwayA08U",
+  "highwayCD", "highwayE", "highwayUF",
+  "hlv", "hpv", "lv2", "lv4", "pv2", "pv4",
+  "range", "rangeCity", "rangeCityA", "rangeHwy", "rangeHwyA",
+  "UCityA", "UHighwayA",
+  "phevCity", "phevHwy", "phevComb"
+)
+```
+
+#### Unused Columns
+
+- `eng_dscr` has ~37% missing values and is a free-text engine description — not suitable for standard regression without NLP.
+- `createdOn` and `modifiedOn` are administrative metadata with no predictive value.
+- `baseModel` has high cardinality and would support memorization of specific model lines rather than generalization.
+- `fuelType` and `fuelType1` are replaced by the new `fuel_group` variable and removed from `vehicles_model` via an explicit `select()`. The raw columns remain intact in the original `data` object.
+
+```{r}
+cols_unused <- c("createdOn", "modifiedOn", "eng_dscr", "baseModel")
+```
+
+#### Combine All Removal Lists
+
+```{r}
+cols_to_remove <- unique(c(cols_missing, cols_ids, cols_leakage,
+                            cols_sparse_or_invalid, cols_unused))
+
+cat("Total columns scheduled for removal:", length(cols_to_remove), "\n")
+```
+
+### Feature Engineering: Electric Vehicles
+
+Electric vehicles do not have a combustion engine and therefore have no `displ` or `cylinders`. Their missing values are structurally meaningful — they signal the absence of an engine, not random data loss. We capture this before any imputation.
+
+- `is_electric`: TRUE if the vehicle runs on electricity only.
+- `has_combustion_engine`: TRUE if the vehicle has a combustion engine.
+
+For EVs, `displ` and `cylinders` are set to 0 — meaning zero displacement, not a statistical fill-in. Remaining missing values in non-EV rows will be handled later by the recipe.
+
+```{r}
+data_fe <- data %>%
+  mutate(
+    is_electric = (fuelType == "Electricity") | (fuelType1 == "Electricity"),
+    is_electric = replace_na(is_electric, FALSE),
+    has_combustion_engine = !is_electric,
+    displ     = if_else(is_electric, 0, displ),
+    cylinders = if_else(is_electric, 0, cylinders)
+  )
+
+cat("Electric vehicles:", sum(data_fe$is_electric), "\n")
+cat("Combustion engine vehicles:", sum(data_fe$has_combustion_engine), "\n")
+```
+
+### Categorical Variable Simplification
+
+All transformations below use deterministic rules (not statistics learned from data), so they can safely be applied before the train/test split.
+
+#### `fuel_group` — Structured Fuel Type Grouping
+
+Instead of lumping rare levels of `fuelType`, we create a new interpretable variable `fuel_group` that consolidates all fuel categories into six meaningful groups. The raw `fuelType` and `fuelType1` columns remain unchanged in the original `data` object. For modeling, only `fuel_group` is used as a predictor — `fuelType` and `fuelType1` are removed from `vehicles_model` to avoid duplicating the same information across multiple columns.
+
+```{r}
+data_fe <- data_fe %>%
+  mutate(
+    fuel_group = case_when(
+      fuelType %in% c("Regular", "Premium", "Midgrade")       ~ "Gasoline",
+      fuelType == "Diesel"                                     ~ "Diesel",
+      fuelType == "Electricity"                                ~ "Electricity",
+      fuelType %in% c(
+        "Premium and Electricity",
+        "Regular Gas and Electricity",
+        "Premium Gas or Electricity",
+        "Regular Gas or Electricity",
+        "Electricity and Hydrogen"
+      )                                                        ~ "Hybrid/Electric mix",
+      fuelType %in% c("Gasoline or E85", "Premium or E85")    ~ "Flex-fuel/E85",
+      fuelType %in% c(
+        "CNG", "Hydrogen",
+        "Gasoline or natural gas",
+        "Gasoline or propane"
+      )                                                        ~ "Alternative fuel",
+      TRUE                                                     ~ "Other"
+    )
+  )
+
+table(data_fe$fuel_group)
+```
+
+#### `drive` — Consolidate 4WD/AWD Variants
+
+The EDA identified multiple overlapping 4-wheel and all-wheel drive labels. We consolidate them into three interpretable groups.
+
+```{r}
+data_fe <- data_fe %>%
+  mutate(drive = case_when(
+    str_detect(drive, "4-Wheel|All-Wheel") ~ "AWD/4WD",
+    str_detect(drive, "Front-Wheel")       ~ "Front-Wheel Drive",
+    str_detect(drive, "Rear-Wheel")        ~ "Rear-Wheel Drive",
+    is.na(drive)                           ~ "Unknown",
+    TRUE                                   ~ "Other"
+  ))
+
+table(data_fe$drive)
+```
+
+#### `VClass` — Keep Top 10 Categories
+
+`VClass` has many levels. We retain the 10 most frequent and collapse the rest into "Other".
+
+```{r}
+data_fe <- data_fe %>%
+  mutate(VClass = fct_lump(as.factor(VClass), n = 10, other_level = "Other"))
+
+table(data_fe$VClass)
+```
+
+#### `trany` — Extract Structured Transmission Features
+
+Instead of keeping the raw high-cardinality `trany` string, we extract three interpretable features:
+
+- `transmission_type`: "Automatic", "Manual", or "Other"
+- `is_cvt`: TRUE if the transmission uses continuously variable gear ratios
+- `n_gears`: number of speeds extracted from text (NA for non-standard transmissions)
+
+The raw `trany` column is then removed.
+
+```{r}
+data_fe <- data_fe %>%
+  mutate(
+    transmission_type = case_when(
+      str_detect(trany, regex("^Automatic", ignore_case = TRUE)) ~ "Automatic",
+      str_detect(trany, regex("^Manual",    ignore_case = TRUE)) ~ "Manual",
+      TRUE ~ "Other"
+    ),
+    is_cvt  = str_detect(trany, regex("variable gear ratios", ignore_case = TRUE)),
+    is_cvt  = replace_na(is_cvt, FALSE),
+    n_gears = as.integer(str_match(trany, "(\\d+)-spd")[, 2])
+  )
+
+cat("Transmission type distribution:\n")
+print(table(data_fe$transmission_type))
+cat("\nCVT vehicles:", sum(data_fe$is_cvt), "\n")
+cat("\nn_gears summary:\n")
+print(summary(data_fe$n_gears))
+```
+
+### Build Final Modeling Dataset
+
+We apply all column removals. The raw `trany` is dropped because it is fully replaced by `transmission_type`, `is_cvt`, and `n_gears`. The raw `fuelType` and `fuelType1` are dropped because their information is captured by `fuel_group` and `is_electric` / `has_combustion_engine`. All three are removed via `any_of()` so the code stays safe if any column is already absent. The target `comb08` is always retained.
+
+```{r}
+vehicles_model <- data_fe %>%
+  select(-any_of(cols_to_remove)) %>%
+  select(-any_of(c("trany", "fuelType", "fuelType1")))
+
+cat("Dimensions of vehicles_model:", nrow(vehicles_model), "×", ncol(vehicles_model), "\n")
+cat("\nColumns retained:\n")
+print(names(vehicles_model))
+```
+
+`cylinders` is kept as a candidate predictor despite its strong correlation with `displ` (~0.91). We expect multicollinearity, but the final decision on whether to drop it is deferred to feature selection in a later scenario.
+
+### Sanity Checks
+
+```{r}
+cat("Duplicate rows in vehicles_model:", sum(duplicated(vehicles_model)), "\n\n")
+
+cat("summary(comb08):\n")
+print(summary(vehicles_model$comb08))
+
+cat("\nYear range:", range(vehicles_model$year, na.rm = TRUE), "\n")
+
+cat("\ncomb08 <= 0:", sum(vehicles_model$comb08 <= 0, na.rm = TRUE), "\n")
+cat("displ < 0:",    sum(vehicles_model$displ    < 0, na.rm = TRUE), "\n")
+cat("cylinders < 0:", sum(vehicles_model$cylinders < 0, na.rm = TRUE), "\n")
+
+missing_before <- colSums(is.na(vehicles_model))
+cat("\nColumns with missing values (before recipe):\n")
+print(missing_before[missing_before > 0])
+cat("Total missing values:", sum(is.na(vehicles_model)), "\n")
+```
+
+High `comb08` values (up to 146 MPG) are not removed. These outliers represent technologically distinct vehicles — primarily electric or highly efficient models — and are valid observations.
+
+### Train/Test Split
+
+We use stratified splitting on `comb08` to ensure both sets reflect similar proportions of common and highly efficient vehicles. Because `comb08` is numeric, `rsample` bins it internally before stratifying.
+
+```{r}
+set.seed(123)
+
+data_split <- initial_split(vehicles_model, prop = 0.8, strata = comb08)
+
+train_data <- training(data_split)
+test_data  <- testing(data_split)
+
+cat("Train:", nrow(train_data), "×", ncol(train_data), "\n")
+cat("Test: ", nrow(test_data),  "×", ncol(test_data),  "\n")
+```
+
+### Check Train/Test Distribution
+
+```{r}
+cat("Train comb08:\n"); print(summary(train_data$comb08))
+cat("Test  comb08:\n"); print(summary(test_data$comb08))
+```
+
+```{r}
+bind_rows(
+  train_data %>% select(comb08) %>% mutate(split = "train"),
+  test_data  %>% select(comb08) %>% mutate(split = "test")
+) %>%
+  ggplot(aes(x = comb08, fill = split)) +
+  geom_density(alpha = 0.5) +
+  scale_fill_manual(values = c("train" = "steelblue", "test" = "tomato")) +
+  labs(
+    title = "Distribution of comb08: Train vs. Test",
+    x     = "Combined MPG (comb08)",
+    y     = "Density"
+  ) +
+  theme_minimal()
+```
+
+The density curves confirm that stratification produces very similar `comb08` distributions in both sets.
+
+### Cross-Validation Folds
+
+We prepare 5-fold cross-validation on the training set, stratified by `comb08`. These folds will be used later for hyperparameter tuning and comparing models.
+
+```{r}
+folds <- vfold_cv(train_data, v = 5, strata = comb08)
+
+cat("Number of CV folds:", nrow(folds), "\n")
+print(folds)
+```
+
+### Preprocessing Recipe
+
+The recipe is defined on `train_data` and fitted only on the training set to prevent leakage of test statistics into training:
+
+- `step_unknown()` — handles unseen factor levels that may appear in the test set
+- `step_other()` — collapses any residual rare categories below 1%
+- `step_impute_median()` — fills remaining numeric NAs with training-set medians (e.g., non-EV rows with missing `displ`)
+- `step_impute_mode()` — fills remaining nominal NAs with training-set modes
+- `step_dummy()` — one-hot encodes all nominal predictors; required by linear regression methods
+- `step_zv()` / `step_nzv()` — removes zero- and near-zero-variance columns, consistent with EDA findings on low-variability variables
+- `step_normalize()` — standardizes all numeric predictors; required for ridge, lasso, elastic net, kNN, and PCA/PCR/PLS
+
+```{r}
+model_recipe <- recipe(comb08 ~ ., data = train_data) %>%
+  step_unknown(all_nominal_predictors()) %>%
+  step_other(all_nominal_predictors(), threshold = 0.01) %>%
+  step_impute_median(all_numeric_predictors()) %>%
+  step_impute_mode(all_nominal_predictors()) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_zv(all_predictors()) %>%
+  step_nzv(all_predictors()) %>%
+  step_normalize(all_numeric_predictors())
+
+model_recipe
+```
+
+### Fit and Apply Recipe
+
+The recipe is fitted exclusively on `train_data`. The same fitted statistics (medians, modes, dummy levels) are then applied to both sets.
+
+```{r}
+prep_recipe <- prep(model_recipe, training = train_data)
+
+train_processed <- bake(prep_recipe, new_data = NULL)
+test_processed  <- bake(prep_recipe, new_data = test_data)
+```
+
+### Verify Preprocessing Output
+
+```{r}
+cat("train_processed:", nrow(train_processed), "×", ncol(train_processed), "\n")
+cat("test_processed: ", nrow(test_processed),  "×", ncol(test_processed),  "\n")
+
+cat("\nMissing values — train_processed:", sum(is.na(train_processed)), "\n")
+cat("Missing values — test_processed: ", sum(is.na(test_processed)),  "\n")
+
+cat("\ncomb08 in train_processed:", "comb08" %in% names(train_processed), "\n")
+cat("comb08 in test_processed: ", "comb08" %in% names(test_processed),  "\n")
+
+n_predictors <- ncol(train_processed) - 1
+cat("\nNumber of predictors after dummy encoding:", n_predictors, "\n")
+
+cat("\nFirst 10 column names:\n")
+print(head(names(train_processed), 10))
+```
+
+Both processed datasets contain no missing values in predictors, and `comb08` is retained as the regression target. The objects `vehicles_model`, `train_data`, `test_data`, `folds`, `model_recipe`, `prep_recipe`, `train_processed`, and `test_processed` are ready for regression scenarios 2, 3, and 5.
