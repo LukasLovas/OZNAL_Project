@@ -344,8 +344,6 @@ Based on the histogram, we can say that the distribution is not normal. The boxp
 
 ## Preprocessing and Train/Test Split
 
-We now prepare the data for regression modeling. This section covers column selection, feature engineering, categorical simplification, sanity checks, train/test split, cross-validation folds, and a preprocessing recipe. No models are trained here.
-
 ```{r message=FALSE, warning=FALSE}
 library(rsample)
 library(recipes)
@@ -557,13 +555,20 @@ print(summary(data_fe$n_gears))
 
 ### Build Final Modeling Dataset
 
-We apply all column removals. The raw `trany` is dropped because it is fully replaced by `transmission_type`, `is_cvt`, and `n_gears`. The raw `fuelType` and `fuelType1` are dropped because their information is captured by `fuel_group` and `is_electric` / `has_combustion_engine`. All three are removed via `any_of()` so the code stays safe if any column is already absent. The target `comb08` is always retained.
+We apply all column removals. The raw `trany` is dropped because it is fully replaced by `transmission_type`, `is_cvt`, and `n_gears`. The raw `fuelType` and `fuelType1` are dropped because their information is captured by `fuel_group`.
+
+Pure battery electric vehicles (BEVs) are excluded from the modeling dataset before the train/test split. The target variable `comb08` represents Miles Per Gallon (MPG) for combustion-engine vehicles, but for BEVs the EPA reports MPGe — an artificial conversion (33.7 kWh = 1 gallon equivalent) that does not reflect actual fuel consumption. Including BEVs would mix two structurally different quantities in a single regression target. Moreover, the features that drive MPGe — battery capacity, motor efficiency, regenerative braking — are not present in the dataset after removing high-missingness columns such as `evMotor`. The `is_electric` and `has_combustion_engine` flags are also dropped after filtering, as they become zero-variance constants.
 
 ```{r}
-vehicles_model <- data_fe %>%
-  select(-any_of(cols_to_remove)) %>%
-  select(-any_of(c("trany", "fuelType", "fuelType1")))
+n_ev <- sum(data_fe$is_electric)
 
+vehicles_model <- data_fe %>%
+  filter(!is_electric) %>%
+  select(-any_of(cols_to_remove)) %>%
+  select(-any_of(c("trany", "fuelType", "fuelType1", "is_electric", "has_combustion_engine")))
+
+cat("Electric vehicles excluded:", n_ev, "\n")
+cat("Remaining vehicles:        ", nrow(vehicles_model), "\n")
 cat("Dimensions of vehicles_model:", nrow(vehicles_model), "×", ncol(vehicles_model), "\n")
 cat("\nColumns retained:\n")
 print(names(vehicles_model))
@@ -591,7 +596,7 @@ print(missing_before[missing_before > 0])
 cat("Total missing values:", sum(is.na(vehicles_model)), "\n")
 ```
 
-High `comb08` values (up to 146 MPG) are not removed. These outliers represent technologically distinct vehicles — primarily electric or highly efficient models — and are valid observations.
+After excluding BEVs, the remaining `comb08` values reflect actual MPG from combustion-engine and hybrid vehicles. Extreme values at the high end (diesel hybrids, efficient compact cars) are retained as valid observations.
 
 ### Train/Test Split
 
@@ -702,3 +707,485 @@ print(head(names(train_processed), 10))
 ```
 
 Both processed datasets contain no missing values in predictors, and `comb08` is retained as the regression target. The objects `vehicles_model`, `train_data`, `test_data`, `folds`, `model_recipe`, `prep_recipe`, `train_processed`, and `test_processed` are ready for regression scenarios 2, 3, and 5.
+
+## Scenario 2: Parametric vs. Non-Parametric Models — Parametric Part
+
+Parametric models assume that the relationship between predictors and the response follows a specific, fixed mathematical form — in regression, a linear combination of weighted features.
+
+We compare four parametric regression methods:
+
+1. **Linear Regression (OLS)** — the classical least-squares baseline, no regularization
+2. **Ridge Regression** — OLS plus an L2 penalty that shrinks all coefficients toward zero
+3. **LASSO** — OLS plus an L1 penalty that can shrink some coefficients to exactly zero, selecting features
+4. **Elastic Net** — a blend of Ridge and LASSO penalties, combining both approaches
+
+All four methods share the same preprocessing recipe defined in the previous section. We use the 5-fold cross-validation folds for hyperparameter tuning and model comparison, and evaluate final performance on the held-out test set.
+
+```{r message=FALSE, warning=FALSE}
+library(tidymodels)
+library(broom)
+library(glmnet)
+```
+
+We define the three evaluation metrics once and reuse them across every model.
+
+```{r}
+eval_metrics <- metric_set(rmse, rsq, mae)
+```
+
+---
+
+### 1. Linear Regression (OLS)
+
+Ordinary least squares minimizes the sum of squared residuals and imposes no constraint on coefficient size. It is our reference point — any benefit from regularization will appear as an improvement over this baseline.
+
+```{r}
+lm_spec <- linear_reg() %>%
+  set_engine("lm") %>%
+  set_mode("regression")
+
+lm_wf <- workflow() %>%
+  add_recipe(model_recipe) %>%
+  add_model(lm_spec)
+```
+
+`fit_resamples()` runs the complete preprocessing + fitting pipeline independently on each of the 5 folds, so no information from the validation fold leaks into training.
+
+```{r warning=FALSE}
+set.seed(123)
+
+lm_cv <- lm_wf %>%
+  fit_resamples(
+    resamples = folds,
+    metrics   = eval_metrics,
+    control   = control_resamples(save_pred = TRUE)
+  )
+
+lm_cv_metrics <- collect_metrics(lm_cv)
+cat("=== OLS — 5-fold CV ===\n")
+cat("RMSE:", round(lm_cv_metrics %>% filter(.metric == "rmse") %>% pull(mean), 4),
+    "  ±", round(lm_cv_metrics %>% filter(.metric == "rmse") %>% pull(std_err), 4), "\n")
+cat("MAE: ", round(lm_cv_metrics %>% filter(.metric == "mae")  %>% pull(mean), 4), "\n")
+cat("R²:  ", round(lm_cv_metrics %>% filter(.metric == "rsq")  %>% pull(mean), 4), "\n")
+```
+
+Now we fit on the full training set to inspect which predictors drive the predictions.
+
+```{r}
+lm_fit <- lm_wf %>% fit(data = train_data)
+
+lm_fit %>%
+  extract_fit_parsnip() %>%
+  tidy() %>%
+  filter(term != "(Intercept)") %>%
+  slice_max(abs(estimate), n = 20) %>%
+  ggplot(aes(x = reorder(term, abs(estimate)), y = estimate)) +
+  geom_col(aes(fill = estimate > 0)) +
+  coord_flip() +
+  scale_fill_manual(
+    values = c("TRUE" = "steelblue", "FALSE" = "tomato"),
+    labels = c("TRUE" = "Positive", "FALSE" = "Negative"),
+    name   = "Direction"
+  ) +
+  labs(
+    title = "OLS: Top 20 Predictors by Absolute Coefficient",
+    x     = NULL,
+    y     = "Coefficient estimate"
+  ) +
+  theme_minimal()
+```
+
+Blue bars indicate predictors that increase `comb08` (e.g. electric drivetrain), red bars indicate predictors that decrease it (e.g. larger engine displacement).
+
+---
+
+### 2. Ridge Regression
+
+Ridge regression adds an L2 penalty — λ × Σβ² — to the OLS loss. This forces the optimiser to keep coefficients small, reducing variance at the cost of some bias. Ridge never removes a predictor entirely: all coefficients are shrunk toward zero, but remain non-zero. It is especially effective when predictors are correlated — a situation we identified between `displ` and `cylinders` in the EDA.
+
+The regularization strength λ is controlled by `penalty`. We tune it over a log-spaced grid.
+
+```{r}
+ridge_spec <- linear_reg(penalty = tune(), mixture = 0) %>%
+  set_engine("glmnet") %>%
+  set_mode("regression")
+
+ridge_wf <- workflow() %>%
+  add_recipe(model_recipe) %>%
+  add_model(ridge_spec)
+```
+
+`glmnet` fits the entire regularization path in a single pass, so evaluating 50 penalty values has almost no extra cost compared to evaluating one.
+
+```{r}
+ridge_grid <- grid_regular(penalty(range = c(-4, 2)), levels = 50)
+```
+
+```{r warning=FALSE}
+set.seed(123)
+
+ridge_cv <- ridge_wf %>%
+  tune_grid(
+    resamples = folds,
+    grid      = ridge_grid,
+    metrics   = eval_metrics
+  )
+
+autoplot(ridge_cv)
+```
+
+At very low penalty (left end), Ridge behaves like OLS. As penalty increases, coefficients shrink and the model becomes more biased but less variable. The optimal point is where RMSE on the validation folds is minimized.
+
+```{r}
+best_ridge <- ridge_cv %>% select_best(metric = "rmse")
+
+ridge_best_row <- show_best(ridge_cv, metric = "rmse", n = 1)
+cat("=== Ridge — best hyperparameter ===\n")
+cat("Best penalty:", round(best_ridge$penalty, 6), "\n")
+cat("CV RMSE:     ", round(ridge_best_row$mean, 4),
+    "  ±", round(ridge_best_row$std_err, 4), "\n")
+```
+
+```{r}
+ridge_final_wf <- ridge_wf %>% finalize_workflow(best_ridge)
+ridge_fit       <- ridge_final_wf %>% fit(data = train_data)
+```
+
+```{r}
+ridge_fit %>%
+  extract_fit_parsnip() %>%
+  tidy() %>%
+  filter(term != "(Intercept)") %>%
+  slice_max(abs(estimate), n = 20) %>%
+  ggplot(aes(x = reorder(term, abs(estimate)), y = estimate)) +
+  geom_col(aes(fill = estimate > 0)) +
+  coord_flip() +
+  scale_fill_manual(
+    values = c("TRUE" = "steelblue", "FALSE" = "tomato"),
+    labels = c("TRUE" = "Positive", "FALSE" = "Negative"),
+    name   = "Direction"
+  ) +
+  labs(
+    title = paste0("Ridge: Top 20 Predictors (penalty = ",
+                   round(best_ridge$penalty, 5), ")"),
+    x     = NULL,
+    y     = "Coefficient estimate"
+  ) +
+  theme_minimal()
+```
+
+Compared to OLS, Ridge produces smaller coefficient magnitudes across all predictors. The ordering and direction of the most important features generally remains the same, but correlated predictors share their weight more evenly.
+
+---
+
+### 3. LASSO Regression
+
+LASSO (Least Absolute Shrinkage and Selection Operator) uses an L1 penalty — λ × Σ|β|. The key geometric property of L1 is that the regularized solution often lands exactly at zero for many coefficients. LASSO therefore performs simultaneous regression and feature selection: it automatically identifies the most informative predictors and removes the rest.
+
+```{r}
+lasso_spec <- linear_reg(penalty = tune(), mixture = 1) %>%
+  set_engine("glmnet") %>%
+  set_mode("regression")
+
+lasso_wf <- workflow() %>%
+  add_recipe(model_recipe) %>%
+  add_model(lasso_spec)
+```
+
+LASSO typically needs smaller penalties than Ridge to achieve similar shrinkage, so we search a narrower range.
+
+```{r}
+lasso_grid <- grid_regular(penalty(range = c(-4, 0)), levels = 50)
+```
+
+```{r warning=FALSE}
+set.seed(123)
+
+lasso_cv <- lasso_wf %>%
+  tune_grid(
+    resamples = folds,
+    grid      = lasso_grid,
+    metrics   = eval_metrics
+  )
+
+autoplot(lasso_cv)
+```
+
+```{r}
+best_lasso <- lasso_cv %>% select_best(metric = "rmse")
+
+lasso_best_row <- show_best(lasso_cv, metric = "rmse", n = 1)
+cat("=== LASSO — best hyperparameter ===\n")
+cat("Best penalty:", round(best_lasso$penalty, 6), "\n")
+cat("CV RMSE:     ", round(lasso_best_row$mean, 4),
+    "  ±", round(lasso_best_row$std_err, 4), "\n")
+```
+
+```{r}
+lasso_final_wf <- lasso_wf %>% finalize_workflow(best_lasso)
+lasso_fit       <- lasso_final_wf %>% fit(data = train_data)
+```
+
+One of LASSO's main advantages is sparsity. Let's see how many predictors it retained.
+
+```{r}
+lasso_coefs <- lasso_fit %>%
+  extract_fit_parsnip() %>%
+  tidy() %>%
+  filter(term != "(Intercept)")
+
+cat("=== LASSO — sparsity ===\n")
+cat("Total predictors available:", nrow(lasso_coefs), "\n")
+cat("Kept by LASSO (non-zero):  ", sum(lasso_coefs$estimate != 0), "\n")
+cat("Removed by LASSO (zero):   ", sum(lasso_coefs$estimate == 0), "\n")
+if (sum(lasso_coefs$estimate == 0) > 0) {
+  cat("Zeroed out predictors:\n")
+  print(lasso_coefs %>% filter(estimate == 0) %>% pull(term))
+}
+```
+
+```{r}
+lasso_coefs %>%
+  filter(estimate != 0) %>%
+  slice_max(abs(estimate), n = 20) %>%
+  ggplot(aes(x = reorder(term, abs(estimate)), y = estimate)) +
+  geom_col(aes(fill = estimate > 0)) +
+  coord_flip() +
+  scale_fill_manual(
+    values = c("TRUE" = "steelblue", "FALSE" = "tomato"),
+    labels = c("TRUE" = "Positive", "FALSE" = "Negative"),
+    name   = "Direction"
+  ) +
+  labs(
+    title = paste0("LASSO: Top 20 Non-Zero Predictors (penalty = ",
+                   round(best_lasso$penalty, 5), ")"),
+    x     = NULL,
+    y     = "Coefficient estimate"
+  ) +
+  theme_minimal()
+```
+
+LASSO retains only the most informative predictors, which makes the resulting model more parsimonious and directly interpretable compared to OLS or Ridge. Predictors that survive the L1 penalty are the ones that the algorithm judged worth the cost of adding a parameter.
+
+---
+
+### 4. Elastic Net
+
+Elastic Net combines both L1 and L2 penalties: λ × [α × Σ|β| + (1 − α) × Σβ²]. The `mixture` parameter in tidymodels corresponds to α:  `mixture = 0` gives pure Ridge, `mixture = 1` gives pure LASSO. By tuning both `penalty` and `mixture`, Elastic Net finds the best blend — it can perform feature selection like LASSO while also handling correlated predictors like Ridge.
+
+```{r}
+en_spec <- linear_reg(penalty = tune(), mixture = tune()) %>%
+  set_engine("glmnet") %>%
+  set_mode("regression")
+
+en_wf <- workflow() %>%
+  add_recipe(model_recipe) %>%
+  add_model(en_spec)
+```
+
+We use a regular 10 × 10 grid — 10 penalty values and 10 mixture values — giving 100 combinations. `glmnet` evaluates all penalty values for each mixture in a single path, so this is still fast.
+
+```{r}
+en_grid <- grid_regular(
+  penalty(range = c(-4, 0)),
+  mixture(range = c(0, 1)),
+  levels = 10
+)
+```
+
+```{r warning=FALSE}
+set.seed(123)
+
+en_cv <- en_wf %>%
+  tune_grid(
+    resamples = folds,
+    grid      = en_grid,
+    metrics   = eval_metrics
+  )
+
+autoplot(en_cv)
+```
+
+```{r}
+best_en <- en_cv %>% select_best(metric = "rmse")
+
+en_best_row <- show_best(en_cv, metric = "rmse", n = 1)
+cat("=== Elastic Net — best hyperparameters ===\n")
+cat("Best penalty:", round(best_en$penalty, 6), "\n")
+cat("Best mixture:", round(best_en$mixture, 4),
+    " (0 = Ridge, 1 = LASSO)\n")
+cat("CV RMSE:     ", round(en_best_row$mean, 4),
+    "  ±", round(en_best_row$std_err, 4), "\n")
+```
+
+The optimal `mixture` value tells us how the data prefers to be regularized. If the best mixture is close to 1, LASSO-like behavior is preferred; if it is close to 0, Ridge-like behavior is preferred.
+
+```{r}
+en_final_wf <- en_wf %>% finalize_workflow(best_en)
+en_fit       <- en_final_wf %>% fit(data = train_data)
+```
+
+---
+
+### Comparing All Parametric Models
+
+We evaluate all four models on the held-out test set. Because each model is a full `workflow()` that includes the preprocessing recipe, we pass the raw `test_data` directly and the recipe transformations are applied automatically.
+
+We write a small helper function so we do not repeat the same prediction + metric code four times.
+
+```{r}
+get_test_metrics <- function(fit, model_name) {
+  fit %>%
+    predict(new_data = test_data) %>%
+    bind_cols(test_data %>% select(comb08)) %>%
+    summarise(
+      model = model_name,
+      RMSE  = rmse_vec(truth = comb08, estimate = .pred),
+      MAE   = mae_vec( truth = comb08, estimate = .pred),
+      Rsq   = rsq_vec( truth = comb08, estimate = .pred)
+    )
+}
+```
+
+```{r}
+test_comparison <- bind_rows(
+  get_test_metrics(lm_fit,    "Linear Regression"),
+  get_test_metrics(ridge_fit, "Ridge"),
+  get_test_metrics(lasso_fit, "LASSO"),
+  get_test_metrics(en_fit,    "Elastic Net")
+) %>%
+  arrange(RMSE)
+
+test_comparison
+```
+
+```{r}
+test_comparison %>%
+  pivot_longer(cols = c(RMSE, MAE, Rsq),
+               names_to  = "metric",
+               values_to = "value") %>%
+  ggplot(aes(x = reorder(model, value), y = value, fill = model)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~metric, scales = "free_x") +
+  coord_flip() +
+  labs(
+    title = "Test Set Performance: Parametric Models",
+    x     = NULL,
+    y     = "Value"
+  ) +
+  theme_minimal()
+```
+
+For RMSE and MAE, lower is better. For R², higher is better. The bar chart lets us compare the four models at a glance across all three metrics simultaneously.
+
+#### Cross-Validation vs. Test Set RMSE
+
+As a sanity check, we compare the best CV RMSE achieved during tuning with the final test RMSE. A close match confirms that our cross-validation estimate was reliable and there is no significant overfitting.
+
+```{r}
+cv_rmse_comparison <- tibble(
+  model   = c("Linear Regression", "Ridge", "LASSO", "Elastic Net"),
+  cv_rmse = c(
+    collect_metrics(lm_cv)    %>% filter(.metric == "rmse") %>% pull(mean),
+    show_best(ridge_cv, metric = "rmse", n = 1) %>% pull(mean),
+    show_best(lasso_cv, metric = "rmse", n = 1) %>% pull(mean),
+    show_best(en_cv,    metric = "rmse", n = 1) %>% pull(mean)
+  )
+) %>%
+  left_join(
+    test_comparison %>% select(model, test_rmse = RMSE),
+    by = "model"
+  ) %>%
+  mutate(gap = abs(test_rmse - cv_rmse)) %>%
+  arrange(cv_rmse)
+
+cv_rmse_comparison
+```
+
+A small `gap` value confirms that each model generalizes to new data about as well as it performed during cross-validation, with no significant overfit to the training set.
+
+#### Actual vs. Predicted — All Models
+
+Finally, we plot actual versus predicted values for all four models on the test set. Points along the diagonal red line indicate perfect predictions.
+
+```{r}
+all_test_preds <- bind_rows(
+  lm_fit    %>% predict(new_data = test_data) %>% bind_cols(test_data %>% select(comb08)) %>% mutate(model = "Linear Regression"),
+  ridge_fit %>% predict(new_data = test_data) %>% bind_cols(test_data %>% select(comb08)) %>% mutate(model = "Ridge"),
+  lasso_fit %>% predict(new_data = test_data) %>% bind_cols(test_data %>% select(comb08)) %>% mutate(model = "LASSO"),
+  en_fit    %>% predict(new_data = test_data) %>% bind_cols(test_data %>% select(comb08)) %>% mutate(model = "Elastic Net")
+)
+
+all_test_preds %>%
+  ggplot(aes(x = comb08, y = .pred)) +
+  geom_point(alpha = 0.15, color = "steelblue", size = 0.8) +
+  geom_abline(slope = 1, intercept = 0, color = "tomato", linewidth = 0.8) +
+  facet_wrap(~model) +
+  labs(
+    title = "Actual vs. Predicted — Test Set (Parametric Models)",
+    x     = "Actual combined MPG",
+    y     = "Predicted combined MPG"
+  ) +
+  theme_minimal()
+```
+
+With battery electric vehicles excluded, all observations in this plot share the same physical interpretation of `comb08` — actual fuel consumption in MPG. Points along the diagonal indicate accurate predictions. Any remaining scatter at higher MPG values reflects plug-in hybrids and highly efficient compacts where the linear model may still be under-fitted, but the fan-shaped distortion caused by MPGe outliers is no longer present.
+
+---
+
+### Summary: Parametric Models
+
+All four parametric models share the same fundamental assumption: the relationship between predictors and `comb08` is linear. Their differences lie entirely in regularization:
+
+| Model | Penalty | Sparsity | Main strength |
+|---|---|---|---|
+| OLS | None | No | Full interpretability, baseline |
+| Ridge | L2 (sum of β²) | No | Handles correlated predictors |
+| LASSO | L1 (sum of \|β\|) | Yes | Automatic feature selection |
+| Elastic Net | L1 + L2 | Yes | Adaptive blend of Ridge and LASSO |
+
+On a large dataset like ours (~48 000 rows), the performance differences between OLS and the regularized models tend to be modest — there is enough data that variance is already well-controlled. The greater advantage of Ridge, LASSO, and Elastic Net is **reproducibility**: the penalty stabilizes coefficient estimates, making the model less sensitive to random variation in the training sample. LASSO additionally enhances **explainability** by producing a sparse model that a practitioner can read through quickly without being distracted by dozens of near-zero coefficients.
+
+---
+
+### Conclusion: Are Parametric Models Suitable for This Problem?
+
+#### Impact of excluding battery electric vehicles
+
+Before any model comparison, it is worth quantifying the effect of the BEV exclusion decision. The original mixed dataset (49 846 vehicles) contained 1 425 battery electric vehicles whose `comb08` values represent MPGe — a unit-converted proxy incompatible with the MPG values of combustion vehicles. Removing them reduced the dataset to 48 421 observations and had a substantial impact on model accuracy: RMSE dropped from 8.11 MPG to **3.36 MPG** (a 59% reduction) and MAE from 5.15 to **2.19 MPG**, while R² improved only modestly from 0.642 to 0.661. The small R² change is expected — R² is scale-independent and measures the proportion of explained variance, which remains similar once the target distribution is homogeneous. The large absolute improvement in RMSE confirms that the BEV segment was the dominant source of prediction error, not the model itself.
+
+#### Overall performance
+
+All four models achieved nearly identical results on the held-out test set: **RMSE ≈ 3.36 MPG, MAE ≈ 2.19 MPG, R² ≈ 0.661**. In context, the median `comb08` in this dataset is 20 MPG, so the average absolute prediction error of 2.19 MPG represents roughly 11% of the median — a reasonable level of accuracy for a linear model using only 21 features. The range of the target variable after BEV exclusion is 7–74 MPG, with the bulk of observations concentrated between 15 and 30 MPG, which is where the model performs best.
+
+#### Why regularization did not help
+
+The cross-validation tuning selected `penalty = 0.0001` (the smallest value in the search grid) for Ridge, LASSO, and Elastic Net alike. This is not a failure of the tuning procedure — it is a meaningful result. With 38 735 training observations and only 21 predictors after dummy encoding, the ordinary least squares estimator already operates in a regime where variance is very low. Regularization is most beneficial when the number of predictors is large relative to the number of observations, or when predictors are strongly collinear. Neither condition dominates here: the recipe collapsed rare factor levels, removed near-zero-variance columns, and normalized all numeric predictors, leaving a well-conditioned design matrix.
+
+The near-zero optimal penalty also explains why LASSO retained all 21 predictors. Variable selection via LASSO is a threshold phenomenon — coefficients are set to exactly zero only when the penalty exceeds a level specific to each predictor's contribution. At `penalty = 1e-4`, every predictor carries enough signal that removing it would increase prediction error. This is a positive diagnostic: it means the preprocessing produced a lean, non-redundant feature set where every column earns its place.
+
+The Elastic Net selected `mixture = 0.222`, indicating a slight preference for Ridge-like behavior over LASSO. Combined with a near-zero penalty, this further confirms that the dataset does not require aggressive shrinkage.
+
+#### Why the models are still a reasonable choice
+
+Despite the uniformity of results across all four methods, parametric models serve several legitimate purposes in this setting:
+
+1. **Interpretability.** The coefficient plots reveal that `cylinders`, fuel type (gasoline vs. alternative), `year`, and `displ` are the dominant drivers of fuel efficiency — in directions fully consistent with domain knowledge. More powerful black-box methods may improve RMSE by a small margin, but at the cost of being unable to explain *why* a vehicle receives a specific MPG rating. For regulatory, engineering, or audit use cases, interpretability is a hard requirement.
+
+2. **Generalization.** The CV–test RMSE gap is below 0.005 for all four models, confirming essentially zero overfitting. The cross-validation estimates were reliable predictors of held-out performance. A model that generalizes this cleanly requires minimal post-deployment monitoring.
+
+3. **Appropriate baseline.** Before applying more flexible methods, it is standard practice to establish what a well-tuned linear model can achieve. RMSE ≈ 3.36 MPG and R² ≈ 0.661 set the benchmark any non-parametric method must surpass to justify its added complexity.
+
+#### Where parametric models fall short
+
+The core limitation is the linearity assumption. Fuel efficiency is shaped by interactions and non-linearities that a linear model cannot capture without explicit feature engineering:
+
+- The effect of `cylinders` on MPG is not constant — the marginal cost of adding one cylinder differs between a 4-cylinder and a V8 engine.
+- Plug-in hybrids (PHEVs) and mild hybrids introduce efficiency characteristics that depend on the interplay between electric and combustion components, not captured by individual feature coefficients.
+- Manufacturer-specific engineering decisions (turbocharging, variable valve timing, cylinder deactivation) create within-brand patterns that a global linear model averages away.
+
+These limitations appear as residual scatter in the actual vs. predicted plots, particularly above 40 MPG where highly efficient compacts and hybrids cluster. Unlike the previous runs, this scatter no longer shows a systematic fan shape driven by MPGe outliers — what remains is genuine model uncertainty about non-linear efficiency relationships.
+
+#### Final assessment
+
+Parametric models are well-suited to this problem as an **interpretable, stable, and computationally efficient solution for combustion-engine vehicle fuel efficiency prediction**. After appropriate exclusion of battery electric vehicles, they achieve RMSE ≈ 3.36 MPG (≈11% of the median), explain 66% of the variance in fuel economy using 21 features, and generalize to unseen data with negligible loss. Coefficients align with physical intuition and are stable across all four model variants. The primary remaining limitation is the inability to capture non-linear interactions between engine parameters — a structural constraint of the linear model family that motivates the use of non-parametric methods as a comparison point.
