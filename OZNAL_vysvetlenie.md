@@ -13,6 +13,7 @@
 5. [Vyhodnocovacie metriky](#5-vyhodnocovacie-metriky)
 6. [Výsledky a záver — Scenario 2](#6-výsledky-a-záver--scenario-2)
 7. [Slovník kľúčových príkazov](#7-slovník-kľúčových-príkazov)
+8. [Scenario 5: Lineárna diskriminačná analýza (LDA)](#8-scenario-5-lineárna-diskriminačná-analýza-lda)
 
 ---
 
@@ -301,6 +302,14 @@ test_data  <- testing(data_split)
 >
 > **Zlaté pravidlo:** Testovací set **nikdy nevidí model** počas trénovania ani tuningu. Ak ho použiješ na rozhodnutia (napr. "vyberiem model, ktorý má lepšie test RMSE"), stáva sa de facto trénovacím setom a tvoja záverečná metrika je optimisticky zaujatá.
 
+> **📚 Poučka: Prečo sa testovací set nesmie použiť viackrát**
+>
+> Predstav si, že máš 10 rôznych modelov a pre každý zmeriaš test RMSE. Potom vybereš model s najlepším test RMSE. Čo si vlastne urobil? Vybral si model, ktorý *náhodou* sedí najlepšie na konkrétnych 9 686 testovacích riadkoch. Ak by si dostal iný náhodný test set, možno by vyhral iný model.
+>
+> Toto je **implicit multiple testing** — čím viac modelov porovnáš na test sete, tým väčšia šanca, že "víťaz" je víťaz len náhodou. Štatistici to nazývajú **overfitting na testovací set**.
+>
+> Správny postup: všetky rozhodnutia (výber modelu, ladenie hyperparametrov) robiť na cross-validation foldoch z trénovacej sady. Test set použiť **raz** na záverečné číslo, ktoré ide do reportu.
+
 ### 3.4 Cross-Validation
 
 ```r
@@ -327,6 +336,16 @@ Fold 5: [Train: 1,2,3,4] [Validate: 5]
 > **Hlavný účel v našom projekte:** Hyperparameter tuning. Penalty pre Ridge/LASSO/Elastic Net ladíme na CV foldoch — testovací set sa pri tomto procese **vôbec nepoužíva**. Až keď máme finálny model s najlepšou penalty, raz ho evaluujeme na test sete.
 >
 > **Prečo 5 foldov?** Je to štandard. Viac foldov (napr. 10) dáva presnejší odhad, ale trvá dlhšie. Pri >10 000 vzorkách je 5-fold dostatočné.
+
+> **📚 Poučka: Prečo CV a nie tretí "validačný" set**
+>
+> Alternatívou ku CV by bol **train / validation / test** triple split: trénovaciu sadu rozdeliť ešte raz na tréning (napr. 64%) a validáciu (16%), a validation sadu použiť na hyperparameter tuning.
+>
+> Problém: každé rozdelenie zahodí dáta. Pri 48 000 riadkoch to nie je kritické, ale pri 5 000 riadkoch by bol model trénovaný len na 3 200 príkladoch — príliš málo. CV riešenie: každý riadok je raz validačný, 4× trénovací. Nič sa nezahadzuje, každý riadok prispieva k odhadu výkonu.
+>
+> Navyše CV dáva **stabilnejší odhad** — priemer 5 validačných výsledkov je menej citlivý na konkrétne rozloženie dát ako jeden validation set.
+>
+> **Kedy CV nestačí:** Ak máš časové rady (napr. ceny akcií), bežná CV "miešaním" porušuje časové poradie. Tam sa používa *time-series CV* (training window posúvaná vpred). Pre naše vozidlá je náhodné miešanie správne — poradie záznamu nemá žiadny vplyv.
 
 #### Ako presne prebieha ladenie hyperparametra `penalty`
 
@@ -484,6 +503,87 @@ test_processed  <- bake(prep_recipe, new_data = test_data)
 - **`bake(new_data = test_data)`** — aplikuje **rovnaké** uložené štatistiky na testovací set
 
 Výsledok: 21 prediktorov po dummy encoding, 0 chýbajúcich hodnôt.
+
+### 3.6 Prečo `recipe` a nie manuálny preprocessing
+
+Preprocessing sa dá spraviť aj bez `recipe` — ručnými transformáciami priamo na dataframe. Porovnanie:
+
+**Manuálny prístup:**
+```r
+# Vypočítaj štatistiky z trénovacej sady
+train_means <- colMeans(train_data[numerics], na.rm = TRUE)
+train_sds   <- apply(train_data[numerics], 2, sd, na.rm = TRUE)
+
+# Normalizuj train
+train_scaled <- sweep(train_data[numerics], 2, train_means, "-")
+train_scaled <- sweep(train_scaled,         2, train_sds,   "/")
+
+# Aplikuj TIE ISTÉ parametre na test
+test_scaled  <- sweep(test_data[numerics],  2, train_means, "-")
+test_scaled  <- sweep(test_scaled,          2, train_sds,   "/")
+```
+
+Problémy:
+1. **Náchylné na chyby** — ľahko zabudneš použiť `train_means` na test set a omylom vypočítaš nové z `test_data`
+2. **Nefunguje v CV** — pri cross-validácii musíš tieto výpočty zopakovať ručne pre každý fold zvlášť, inak dôjde k leakage
+3. **Ťažko rozšíriteľné** — pridanie nového kroku (napr. `step_other`) znamená zmenu na viacerých miestach
+
+**Recipe prístup:**
+```r
+recipe <- recipe(comb08 ~ ., data = train_data) %>%
+  step_normalize(all_numeric_predictors())
+
+# V cross-validácii:
+# tidymodels automaticky pre každý fold:
+#   prep(recipe, training = fold_train)   ← len z fold_train
+#   bake(recipe, new_data = fold_valid)   ← aplikuje fold_train štatistiky
+```
+
+Recipe je **deklaratívny** — opisuješ čo chceš, nie ako to urobiť. `prep()` + `bake()` sa starajú o správny tok dát. Vo workflow sa recipe aplikuje samostatne pre každý CV fold, čo je jediný správny postup.
+
+> **📚 Poučka: Data leakage cez normalizáciu — konkrétny príklad**
+>
+> Predstav si dataset: train_data má `displ` s priemerom 3.2 a SD 1.1. Test_data má `displ` s priemerom 3.0 a SD 1.05 (mierne iné kvôli náhode).
+>
+> **Správne:** normalizuješ test pomocou train štatistík (3.2, 1.1). Test hodnota 5.0 sa stane (5.0 − 3.2) / 1.1 = 1.636.
+>
+> **Chybne:** normalizuješ test pomocou jeho vlastných štatistík (3.0, 1.05). Test hodnota 5.0 sa stane (5.0 − 3.0) / 1.05 = 1.905.
+>
+> Model bol trénovaný s "jazykom" train normalizácie. Chybná normalizácia dá modelu vstup s iným "jazykom" — predikcie sú systematicky posunuté. Pri veľkých datasetoch je rozdiel malý, ale pri malých datasetoch alebo pri outlieroch môže byť zásadný.
+
+### 3.7 Prečo `workflow()` — recipe + model ako celok
+
+```r
+lm_wf <- workflow() %>%
+  add_recipe(model_recipe) %>%
+  add_model(lm_spec)
+```
+
+`workflow()` z balíka `workflows` (tidymodels) zbalí recipe a model do jedného objektu. Bez workflow by si musel pred každou predikciou manuálne bake-núť dáta:
+
+```r
+# Bez workflow — ručne:
+test_baked <- bake(prep_recipe, new_data = test_data)
+predictions <- predict(lm_fit, new_data = test_baked)
+
+# S workflow — automaticky:
+predictions <- predict(lm_wf_fit, new_data = test_data)  # recipe sa aplikuje interne
+```
+
+Kľúčová výhoda je v **cross-validácii**: `fit_resamples(lm_wf, resamples = folds)` pre každý fold:
+1. Rozdelí fold na train/validation časti
+2. Zavolá `prep(recipe, training = fold_train)` — naučí recipe len z fold train
+3. Zavolá `bake(recipe, new_data = fold_valid)` — aplikuje fold_train štatistiky na validation
+4. Natrénuje model na fold_train
+5. Evaluuje na fold_valid
+
+Toto sa deje automaticky. Bez workflow by si to musel naprogramovať ručne v slučke — a väčšina ľudí by urobila chybu v kroku 2 (použila by celý train namiesto len fold_train).
+
+> **📚 Poučka: Závislosť workflow od testovacieho setu**
+>
+> Zaujímavá vlastnosť: keď zavoláš `predict(fitted_workflow, new_data = test_data)`, workflow použije **štatistiky naučené z celého `train_data`** (nie z foldov, nie z test_data). To je správne — finálny model bol trénovaný na celom `train_data`, takže aj normalizácia musí pochádzať z celého `train_data`.
+>
+> Toto je dôvod, prečo `fit(lm_wf, data = train_data)` robí dve veci naraz: `prep(recipe, training = train_data)` a `fit(model, data = prepped_train_data)`. Oba kroky sa naučia z `train_data` a uložia sa dovnútra workflow objektu.
 
 ---
 
@@ -1095,6 +1195,644 @@ Regulárne výrazy (regex) — stručná referencia:
 | `.` | Ľubovoľný znak |
 | `*` | 0 alebo viac opakovaní predchádzajúceho |
 | `+` | 1 alebo viac opakovaní |
+
+---
+
+---
+
+## 8. Scenario 5: Lineárna diskriminačná analýza (LDA)
+
+### Čo je LDA a kedy sa používa
+
+LDA (Linear Discriminant Analysis) je metóda, ktorá stojí na pomedzí dvoch úloh: **redukcie dimenzionality** a **klasifikácie**. Vstupom sú číselné prediktory a kategoriálna cieľová premenná. Výstupom sú **diskriminačné osi** — nové súradnice, v ktorých sú triedy čo najlepšie od seba oddelené.
+
+Formálne: LDA hľadá lineárne kombinácie prediktorov (váhové vektory w), ktoré **maximalizujú pomer rozptylu medzi triedami k rozptylu vnútri tried**:
+
+$$\max_w \frac{w^T S_B w}{w^T S_W w}$$
+
+kde:
+- $S_B$ = "between-class scatter matrix" — miera toho, ako ďaleko sú stredy tried od seba
+- $S_W$ = "within-class scatter matrix" — miera toho, ako "rozptýlené" sú body vnútri každej triedy
+
+Riešením tejto optimalizácie sú **vlastné vektory (eigenvektory)** matice $S_W^{-1} S_B$. Každý vlastný vektor definuje jednu diskriminačnú os.
+
+> **📚 Poučka: LDA vs. PCA — supervised vs. unsupervised**
+>
+> Obe metódy robia redukciu dimenzionality — hľadajú "najlepší" nízkorozmerný podpriestor.
+>
+> | | PCA | LDA |
+> |--|-----|-----|
+> | Typ | Unsupervised | Supervised |
+> | Čo maximalizuje | Celkový rozptyl dát | Separáciu tried |
+> | Potrebuje labels? | Nie | Áno |
+> | Počet osí | min(n−1, p) | min(K−1, p) kde K = počet tried |
+>
+> PCA by pre naše dáta mohlo nájsť os, ktorá vysvetľuje veľa variancie, ale nemusí separovať Low/Medium/High triedy. LDA explicitne hľadá os, ktorá triedy separuje — preto je pre klasifikáciu relevantnejšia.
+>
+> **Analógia:** PCA hľadá smer, z ktorého vidíš dáta "najroztiahnutejšie". LDA hľadá smer, z ktorého vidíš *skupiny* "najoddeliteľnejšie".
+
+> **📚 Poučka: Predpoklady LDA**
+>
+> LDA je parametrický model s troma hlavnými predpokladmi:
+> 1. **Multivariátna normalita** — prediktory majú v každej triede normálne rozdelenie
+> 2. **Homogenita kovariancie** — kovariancie matice sú rovnaké pre všetky triedy (homokedasticity)
+> 3. **Linearita** — hranice medzi triedami sú lineárne (roviny v p-dimenzionálnom priestore)
+>
+> V praxi je LDA pomerne robustné voči miernym porušeniam týchto predpokladov, najmä pri veľkých datasetoch. Ak predpoklad homogénnej kovariancie výrazne neplatí, QDA (Quadratic Discriminant Analysis) je lepšia voľba — umožňuje každej triede mať vlastnú kovarianciu (za cenu väčšieho počtu parametrov).
+
+**Kedy použiť LDA:**
+- Keď chceš **klasifikovať** pozorovania do tried a zároveň pochopiť, ktoré prediktory triedy separujú
+- Keď chceš **vizualizovať** dáta v redukovanom priestore (2D projekcia LD1 × LD2)
+- Ako **baseline klasifikátor** pred použitím zložitejších metód
+- Keď triedy sú **lineárne separovateľné** — t.j. existuje lineárna hranica, ktorá ich oddeľuje
+
+---
+
+### 8.1 Diskretizácia cieľovej premennej
+
+LDA je **klasifikačná** metóda — vyžaduje kategoriálnu cieľovú premennú. Naša pôvodná premenná `comb08` je spojitá (MPG). Musíme ju teda previesť na triedy.
+
+```r
+efficiency_cuts <- quantile(vehicles_model$comb08, probs = c(0, 1/3, 2/3, 1))
+
+vehicles_lda <- vehicles_model %>%
+  mutate(
+    efficiency_class = cut(
+      comb08,
+      breaks         = efficiency_cuts,
+      labels         = c("Low", "Medium", "High"),
+      include.lowest = TRUE
+    )
+  ) %>%
+  select(-comb08)
+```
+
+#### `quantile()`
+
+```r
+quantile(x, probs = c(0, 1/3, 2/3, 1))
+```
+
+`quantile()` vypočíta **kvantily** — hodnoty, pod ktorými leží daný podiel pozorovania. `probs = c(0, 1/3, 2/3, 1)` vráti štyri hodnoty:
+- 0. percentil = minimum
+- 33.3. percentil = **1. tertil** (pod ním leží 1/3 dát)
+- 66.7. percentil = **2. tertil** (pod ním leží 2/3 dát)
+- 100. percentil = maximum
+
+Výsledok pre naše dáta:
+```
+  0%  33%  67% 100%
+   7   18   22   74
+```
+Teda: Low = 7–18 MPG, Medium = 18–22 MPG, High = 22–74 MPG.
+
+#### `cut()`
+
+```r
+cut(x, breaks = c(7, 18, 22, 74), labels = c("Low", "Medium", "High"), include.lowest = TRUE)
+```
+
+`cut()` rozdelí spojitý vektor čísel do intervalov (binov). Parametre:
+- `breaks` — hranice intervalov. Pre n tried potrebuješ n+1 hraničných bodov.
+- `labels` — názvy tried (musí byť o 1 menej ako `breaks`)
+- `include.lowest = TRUE` — zahrnie aj minimum do prvého intervalu. Bez toho by hodnota presne rovná minimu ostala `NA`.
+
+Výsledok je **factor** (kategoriálna premenná) s úrovňami Low < Medium < High.
+
+> **📚 Poučka: Prečo tertily a nie fixné hranice?**
+>
+> Mohli by sme zvoliť intuitívne hranice: napr. Low < 20 MPG, 20–30 MPG = Medium, High > 30 MPG. Problém:
+> - Tieto hranice by dali veľmi **nevyvážené triedy** — väčšina áut je v rozsahu 15–25 MPG
+> - LDA predpokladá "rozumne" vyvážené triedy pre stabilné odhady kovariančných matíc
+>
+> Tertily garantujú, že každá trieda má **≈ 1/3 dát** bez ohľadu na tvar distribúcie. Nevýhoda: hranice 18 MPG a 22 MPG sú úzky koridok (Medium trieda má len 4 MPG šírku), čo sťaží klasifikáciu vozidiel blízkych hraniciam.
+>
+> **Záver:** Tertily sú technicky správne, ale interpretačne kompromis. V praxi by sa diskutovalo, či 18–22 MPG skutočne tvorí zmysluplnú "strednú efektívnosť" alebo je to len artefakt rovnomerného delenia.
+
+**Výsledné rozdelenie:**
+```
+   Low  Medium    High
+ 18023   15512   14886
+
+Podiely: Low 37.2%, Medium 32.0%, High 30.7%
+```
+
+Triedy nie sú dokonale vyvážené — Low dominuje, lebo distribúcia MPG má ľahký pravostranný skok (veľa bežných áut s 15–18 MPG). Pre LDA je toto stále prijateľné.
+
+---
+
+### 8.2 Train/Test Split a Cross-Validácia pre klasifikáciu
+
+```r
+set.seed(123)
+lda_split <- initial_split(vehicles_lda, prop = 0.8, strata = efficiency_class)
+lda_train  <- training(lda_split)
+lda_test   <- testing(lda_split)
+lda_folds  <- vfold_cv(lda_train, v = 5, strata = efficiency_class)
+```
+
+Postup je identický s Scenárom 2 — rovnaká funkcia `initial_split()` a `vfold_cv()`, len `strata` teraz odkazuje na kategorickú premennú `efficiency_class` namiesto spojitého `comb08`.
+
+**Prečo nové splity?** `vehicles_lda` je iný objekt ako `vehicles_model` — má `efficiency_class` namiesto `comb08`. Staré `train_data`/`test_data` by tiež funčne fungovali (majú rovnaké riadky), ale nový split je čistejší — explicitne ukazuje, že pre každý scenár sa dáta pripravujú od začiatku s príslušnou cieľovou premennou.
+
+**Výsledok:** Training: 38 735 riadkov, Test: 9 686 riadkov — rovnaké rozmery ako v Scenári 2 (rovnaký dataset, rovnaký seed, len iná cieľová premenná).
+
+---
+
+### 8.3 Recipe a Model Specification pre LDA
+
+```r
+lda_recipe <- recipe(efficiency_class ~ ., data = lda_train) %>%
+  step_unknown(all_nominal_predictors()) %>%
+  step_other(all_nominal_predictors(), threshold = 0.01) %>%
+  step_impute_median(displ, cylinders) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_zv(all_predictors()) %>%
+  step_nzv(all_predictors()) %>%
+  step_normalize(all_numeric_predictors())
+```
+
+Recipe je **identický** s `model_recipe` zo Scenára 2 — rovnaké kroky, len zmenená cieľová premenná (`efficiency_class` namiesto `comb08`). Toto je zámerné — zabezpečuje porovnateľnosť predspracovania naprieč scenármi.
+
+> **📚 Poučka: Prečo je normalizácia dôležitá pre LDA?**
+>
+> LDA počíta kovariancie matice a hľadá diskriminačné smery v priestore prediktorov. Ak má jeden prediktor rozsah 1984–2026 (`year`) a iný 4–16 (`cylinders`), vzdialenosti v priestore prediktorov sú dominované premennou s veľkým rozsahom — `year` bude "vyzerať" dôležitejšie len kvôli škále.
+>
+> Normalizácia (priemer = 0, SD = 1) zabezpečí, že každý prediktor prispieva rovnomerne k výpočtu kovariancií. Výsledné záťaže (loadings) diskriminačných osí sú potom **porovnateľné** — môžeme priamo povedať "prediktor A má väčší vplyv ako B".
+
+```r
+lda_spec <- discrim_linear() %>%
+  set_engine("MASS") %>%
+  set_mode("classification")
+```
+
+#### `discrim_linear()`
+
+`discrim_linear()` je funkcia z balíka **`discrim`** — rozšírenie tidymodels ekosystému pre diskriminačnú analýzu. Je analógom `linear_reg()` pre regresiu.
+
+- **`set_engine("MASS")`** — použije funkciu `MASS::lda()` z balíka MASS (Modern Applied Statistics with S). MASS je klasický štatistický balík v R, `lda()` je jeho najznámejšia funkcia.
+- **`set_mode("classification")`** — explicitne povie, že ide o klasifikačnú úlohu (nie regresiu)
+
+> **📚 Poučka: Prečo discrim + MASS engine namiesto priameho `MASS::lda()`?**
+>
+> Oba prístupy vedú k rovnakému výsledku. Rozdiel je v ekosystéme:
+>
+> **`MASS::lda()` priamo (base R):**
+> ```r
+> lda_fit_basic <- MASS::lda(efficiency_class ~ ., data = train_baked)
+> lda_pred      <- predict(lda_fit_basic, newdata = test_baked)
+> lda_pred$class      # predikované triedy
+> lda_pred$x          # LD súradnice
+> lda_pred$posterior  # posteriórne pravdepodobnosti
+> ```
+> Výhoda: priamočiarejší prístup k internému stavu modelu (`$x`, `$posterior`, `$scaling`). Nevýhoda: musíš ručne riadiť preprocessing — hlavne normalizáciu treba počítať z train a aplikovať na test manuálne (inak data leakage).
+>
+> **`discrim_linear()` v tidymodels:**
+> ```r
+> lda_wf <- workflow() %>% add_recipe(lda_recipe) %>% add_model(lda_spec)
+> lda_fit <- lda_wf %>% fit(data = lda_train)
+> ```
+> Výhoda: recipe sa automaticky aplikuje správne (train štatistiky na test), konzistentné s ostatnými modelmi v projekte. Nevýhoda: interné objekty LDA sú "zabalené" a treba ich extrahovať.
+>
+> Pre jednorázové LDA bez tuningu je base R prístup jednoduchší. Pre konzistenciu s Scenárom 2 sme zvolili tidymodels.
+
+---
+
+### 8.4 Krížová validácia pre LDA
+
+```r
+lda_cv <- fit_resamples(
+  lda_wf,
+  resamples = lda_folds,
+  metrics   = metric_set(accuracy),
+  control   = control_resamples(save_pred = FALSE)
+)
+```
+
+LDA je **uzavreté riešenie** — neexistuje hyperparameter ako `penalty`, ktorý by sme ladili. Preto `tune_grid()` nepotrebujeme, stačí `fit_resamples()`.
+
+Krížová validácia tu slúži jedinému účelu: **nestranný odhad presnosti** pred tréningom na celom trénovacom sete. Testovací set sa stále nepoužíva.
+
+**Výsledok:**
+```
+CV Accuracy: 0.7754 ± 0.0009
+```
+
+Štandardná chyba 0.0009 je extrémne malá — pri 38 735 vzorkách je CV odhad veľmi stabilný.
+
+---
+
+### 8.5 Trénovanie modelu a extrakcia LDA objektu
+
+```r
+lda_fit <- lda_wf %>% fit(data = lda_train)
+
+mass_lda <- lda_fit %>%
+  extract_fit_parsnip() %>%
+  pluck("fit")
+```
+
+#### `extract_fit_parsnip()` a `pluck("fit")`
+
+`lda_fit` je workflow objekt — "obal", ktorý obsahuje recipe aj model. Na prístup k internému stavu MASS lda objektu potrebujeme ho "vybaliť":
+
+1. **`extract_fit_parsnip(lda_fit)`** — vyberie z workflow parsnip model objekt (wrapper okolo MASS lda)
+2. **`pluck("fit")`** — z parsnip objektu vytiahne samotný `MASS::lda` objekt uložený pod kľúčom `"fit"`
+
+`mass_lda` je teraz štandardný výstup funkcie `MASS::lda()` s týmito položkami:
+
+| Položka | Typ | Čo obsahuje |
+|---------|-----|-------------|
+| `mass_lda$prior` | named vector | Apriorné pravdepodobnosti tried |
+| `mass_lda$means` | matrix | Stredné hodnoty prediktorov pre každú triedu |
+| `mass_lda$scaling` | matrix | Záťaže (coefficients) diskriminačných funkcií |
+| `mass_lda$svd` | vector | Singulárne hodnoty (pre výpočet proportion of trace) |
+
+**Apriorné pravdepodobnosti:**
+```
+   Low  Medium    High
+0.3722  0.3204  0.3074
+```
+Tieto hodnoty odrážajú rozdelenie tried v trénovacej sade. LDA ich používa pri Bayesovskej klasifikácii — prior pravdepodobnosť sa kombinuje s likelihood z dát.
+
+> **📚 Poučka: Bayesovský základ LDA**
+>
+> LDA klasifikuje nové pozorovanie do triedy s najväčšou **posteriórnou pravdepodobnosťou**. Podľa Bayesovho teorému:
+>
+> $$P(\text{trieda} = k \mid x) \propto P(x \mid \text{trieda} = k) \cdot P(\text{trieda} = k)$$
+>
+> kde:
+> - $P(x \mid \text{trieda} = k)$ = likelihood — ako pravdepodobné je pozorovanie x v triede k (Gaussovská distribúcia)
+> - $P(\text{trieda} = k)$ = prior — apriorná pravdepodobnosť triedy (z dát: 37%, 32%, 31%)
+>
+> Preto ak sú triedy nevyvážené (napr. Low má 37%), model bude mierne uprednostňovať Low aj pri neistých prípadoch — akceptuje väčší "prior dôkaz" v prospech Low.
+
+---
+
+### 8.6 Diskriminačné osi — redukcia dimenzionality
+
+```r
+prop_trace <- mass_lda$svd^2 / sum(mass_lda$svd^2)
+names(prop_trace) <- paste0("LD", seq_along(prop_trace))
+print(round(prop_trace, 4))
+```
+
+**Výsledok:**
+```
+   LD1    LD2
+0.9821 0.0179
+```
+
+#### Čo je `proportion of trace`?
+
+Pre K tried LDA nájde K−1 diskriminačných osí (pre 3 triedy = 2 osi: LD1 a LD2). Každá os má priradené **singulárne číslo (singular value)**, ktoré meria, ako veľkú separáciu medzi triedami daná os zachytáva.
+
+`proportion of trace` = podiel kvadrátu singulárneho čísla na celkovom súčte kvadrátov:
+
+$$\text{prop}_{LD1} = \frac{\text{svd}_1^2}{\text{svd}_1^2 + \text{svd}_2^2} = \frac{0.9821 \cdot \text{total}}{\text{total}} = 0.9821$$
+
+**Interpretácia:** LD1 zachytáva **98.2%** celkovej separácie medzi triedami. LD2 pridáva len 1.8%. V praxi to znamená, že na vizualizáciu tried stačí **1D projekcia** na LD1 — LD2 nepridáva takmer nič.
+
+> **📚 Poučka: Analogia s PCA — explained variance vs. proportion of trace**
+>
+> V PCA hovoríme o "proportion of explained variance" — podiel celkovej variancie, ktorú daná os zachytáva. V LDA hovoríme o "proportion of trace" — podiel celkovej *separácie tried*.
+>
+> Obe metriky slúžia rovnakej otázke: **koľko osí potrebujeme?** Ak prvá os vysvetlí >90%, zvyšné osi sú zanedbateľné. Pre naše dáta: LD1 = 98.2% → triedy sú takmer dokonale separovateľné jednou lineárnou kombináciou prediktorov.
+>
+> Toto je silný výsledok! Hovorí, že "Low vs. High efektívnosť" je v zásade **jednorozmerný problém** — existuje jedna lineárna kombinácia engineových parametrov, ktorá takmer dokonale oddeľuje neefektívne od efektívnych vozidiel.
+
+#### Projekcia trénovacích dát
+
+```r
+prepped     <- prep(lda_recipe, training = lda_train)
+train_baked <- bake(prepped, new_data = lda_train)
+
+lda_proj <- predict(mass_lda, newdata = select(train_baked, -efficiency_class))
+
+lda_train_proj <- tibble(
+  LD1              = lda_proj$x[, 1],
+  LD2              = lda_proj$x[, 2],
+  efficiency_class = lda_train$efficiency_class
+)
+```
+
+#### `prep()` a `bake()` — manuálna aplikácia recipe
+
+V Scenári 2 nám stačilo `predict(lda_fit, new_data = ...)` — workflow sa postaral o preprocessing automaticky. Tu ale potrebujeme prístup k "surovým" prediktorom pre `predict(mass_lda, ...)` (MASS lda objekt), nie cez workflow.
+
+- **`prep(lda_recipe, training = lda_train)`** — "naučí" recipe z trénovacích dát (vypočíta mediány, škály, dummy úrovne). Vracia *prepped recipe* objekt.
+- **`bake(prepped, new_data = lda_train)`** — aplikuje naučené transformácie na dáta. `new_data = lda_train` aplikuje na train; `new_data = lda_test` by aplikovalo *rovnaké škály* na testovací set.
+
+> **📚 Poučka: Prečo `prep()` musí vidieť len train dáta**
+>
+> `prep(lda_recipe, training = lda_train)` vypočíta napr. mediány pre imputáciu a priemery/SD pre normalizáciu **len z trénovacích dát**. Keď potom zavoláš `bake(prepped, new_data = lda_test)`, tieto uložené hodnoty sa aplikujú na testovací set.
+>
+> Keby si zavolal `prep(lda_recipe, training = bind_rows(lda_train, lda_test))`, štatistiky by boli vypočítané z oboch setov — to je **data leakage**. Testovací set by "pomáhal nastaviť" preprocessing, čo v reálnom nasadení nie je možné (test data v čase trénovania neexistujú).
+
+#### `predict(mass_lda, newdata = ...)$x`
+
+```r
+lda_proj <- predict(mass_lda, newdata = select(train_baked, -efficiency_class))
+```
+
+Funkcia `predict()` pre MASS lda objekt vracia **list** (nie tibble ako tidymodels):
+- `$class` — faktor predikovaných tried
+- `$posterior` — matica posteriórnych pravdepodobností (riadky = pozorovania, stĺpce = triedy)
+- `$x` — **matica LD súradníc** (riadky = pozorovania, stĺpce = LD1, LD2, ...)
+
+`lda_proj$x[, 1]` extrahuje prvý stĺpec = LD1 súradnice pre každé pozorovanie.
+
+#### Vizualizácia s `stat_ellipse()`
+
+```r
+ggplot(lda_train_proj, aes(x = LD1, y = LD2, color = efficiency_class)) +
+  geom_point(alpha = 0.25, size = 0.6) +
+  stat_ellipse(level = 0.95, linewidth = 1.2)
+```
+
+**`stat_ellipse(level = 0.95)`** nakreslí **95% elipsu spoľahlivosti** pre každú triedu. Elipsa je vytvorená z kovariančnej matice bodov v každej triede — reprezentuje oblasť, v ktorej by sme čakali 95% nových pozorovaní z tej istej triedy (za predpokladu normálneho rozdelenia).
+
+> **📚 Poučka: Čo elipsy spoľahlivosti hovoria o separácii tried**
+>
+> Ak sa elipsy **neprekrývajú**: triedy sú dobre separované v danom priestore.
+> Ak sa elipsy **výrazne prekrývajú**: triedy nie sú lineárne oddeliteľné a model bude mať vysokú chybovosť v oblastiach prekryvu.
+>
+> Pre naše dáta: Low a High elipsy by mali byť dobre oddelené pozdĺž LD1. Medium elipsa by mala sedieť medzi nimi — čo vysvetlí, prečo Medium má najnižšiu per-class accuracy (68.8%).
+
+**LD axis ranges (trénovacie dáta):**
+```
+LD1: -6.386 až 4.729
+LD2: -3.422 až 3.743
+```
+
+Rozsah LD1 je väčší ako LD2 — konzistentné s tým, že LD1 zachytáva viac variability.
+
+---
+
+### 8.7 Záťaže diskriminačných osí (Loadings)
+
+```r
+lda_loadings <- as_tibble(mass_lda$scaling, rownames = "predictor")
+```
+
+**`mass_lda$scaling`** je matica rozmerov p × (K−1), kde p = počet prediktorov, K−1 = počet diskriminačných osí. Každý stĺpec (LD1, LD2) obsahuje koeficienty lineárnej kombinácie:
+
+$$LD1 = w_1 \cdot x_1 + w_2 \cdot x_2 + \ldots + w_p \cdot x_p$$
+
+kde $w_j$ je záťaž j-teho prediktora.
+
+**Top 5 prediktorov pre LD1:**
+```
+predictor                  LD1
+displ                   -0.765
+cylinders               -0.618
+has_discrete_gears      -0.615
+drive_Front.Wheel.Drive  0.504
+n_gears                  0.350
+```
+
+**Interpretácia záťaží:**
+- **Záporná záťaž** (displ, cylinders, has_discrete_gears): väčšia hodnota týchto prediktorov posúva vozidlo smerom k Low triede (nižšia efektívnosť = vyššia spotreba)
+- **Kladná záťaž** (drive_Front.Wheel.Drive, n_gears): FWD pohon a viac prevodových stupňov sú asociované s vyššou efektívnosťou
+
+**Fyzikálna interpretácia:**
+- `displ` (−0.765): Väčší objem motora = viac paliva = nižšia efektívnosť. Najsilnejší diskriminátor.
+- `cylinders` (−0.618): Viac valcov = väčší motor = nižšia efektívnosť
+- `has_discrete_gears` (−0.615): Vozidlá s diskrétnymi stupňami (nie CVT) sú priemerne menej efektívne — CVT optimalizuje prevod kontinuálne
+- `drive_Front.Wheel.Drive` (+0.504): FWD je bežné u efektívnych mestských a kompaktných áut
+- `n_gears` (+0.350): Viac prevodových stupňov → motor môže pracovať v optimálnych otáčkach pri rôznych rýchlostiach → lepšia efektívnosť
+
+> **📚 Poučka: Záťaže vs. koeficienty regresie**
+>
+> Záťaže LDA sú **štandardizované** (prediktory boli normalizované) — môžeme ich priamo porovnávať. Väčšia absolútna hodnota = silnejší diskriminátor.
+>
+> Toto je analogické Ridge koeficientom zo Scenára 2. Tam najväčšie (absolútne) koeficienty mali tiež `cylinders` a `displ` — konzistentnosť medzi scenármi potvrdzuje, že tieto prediktory sú skutočne najdôležitejšie pre efektívnosť vozidiel.
+
+---
+
+### 8.8 Klasifikačná výkonnosť
+
+```r
+lda_test_pred <- predict(lda_fit, new_data = lda_test) %>%
+  bind_cols(lda_test %>% select(efficiency_class)) %>%
+  rename(pred = .pred_class, truth = efficiency_class)
+```
+
+`predict(lda_fit, new_data = lda_test)` cez tidymodels workflow vracia tibble so stĺpcom `.pred_class` — predikovaná trieda pre každé pozorovanie. Potom pripojíme skutočné triedy z `lda_test` a premenujeme stĺpce pre čitateľnosť.
+
+#### Klasifikačné metriky
+
+Na rozdiel od regresie (RMSE, MAE, R²) klasifikácia používa iné metriky:
+
+```r
+lda_acc  <- accuracy(lda_test_pred,  truth = truth, estimate = pred)
+lda_prec <- precision(lda_test_pred, truth = truth, estimate = pred, estimator = "macro")
+lda_rec  <- recall(lda_test_pred,    truth = truth, estimate = pred, estimator = "macro")
+```
+
+**Výsledky:**
+```
+Accuracy (celková):   0.7791
+Precision (macro):    0.7790
+Recall    (macro):    0.7779
+```
+
+#### Accuracy
+
+$$\text{Accuracy} = \frac{\text{počet správne klasifikovaných}}{\text{celkový počet}}$$
+
+Najjednoduchšia metrika: aký podiel všetkých pozorovaní bol správne zaradený.
+
+**Naša hodnota: 77.9%** — model správne klasifikuje takmer 8 z 10 vozidiel. Pre 3-triednu úlohu (náhodný odhad = 33%) je to solídny výsledok.
+
+> **📚 Poučka: Kedy Accuracy nestačí**
+>
+> Accuracy je zavádzajúca pri **nevyvážených triedach**. Predstav si: Low = 90% dát, Medium = 5%, High = 5%. Model, ktorý vždy predikuje Low, dosiahne 90% Accuracy — ale je to zbytočný model.
+>
+> Pre naše dáta sú triedy relatívne vyvážené (37%, 32%, 31%), takže Accuracy je tu vhodná metrika.
+
+#### Precision a Recall
+
+Pre binárnu klasifikáciu (dve triedy: Positive/Negative):
+$$\text{Precision} = \frac{TP}{TP + FP} \qquad \text{Recall} = \frac{TP}{TP + FN}$$
+
+Pre **multitriednu** klasifikáciu treba rozšíriť definíciu. Jeden prístup: vypočítaj precision/recall pre každú triedu zvlášť (one-vs-rest) a spriemeruj.
+
+| Trieda | TP | FP | FN | Precision | Recall |
+|--------|----|----|-----|-----------|--------|
+| Low | správne Low | iné → Low | Low → iné | 2935/(2935+629+33) | 2935/(2935+336+8) |
+| Medium | správne Med | iné → Med | Med → iné | 2133/(2133+336+632) | 2133/(2133+629+499) |
+| High | správne High | iné → High | High → iné | 2471/(2471+8+499) | 2471/(2471+33+632) |
+
+**`estimator = "macro"`** — aritmetický priemer precision/recall cez všetky triedy. Každá trieda má rovnakú váhu bez ohľadu na počet pozorovaní.
+
+> **📚 Poučka: Macro vs. Weighted averaging**
+>
+> Pri `estimator = "macro"`: každá trieda má rovnakú váhu → Low, Medium, High sú rovnako dôležité
+> Pri `estimator = "macro_weighted"`: váha = počet pozorovaní v triede → väčšia trieda má väčší vplyv
+>
+> Pre akademické porovnanie modelov je "macro" štandard — nechceme, aby výsledok závisel od náhodnej nevyváženosti tried.
+
+#### Konfúzna matica
+
+```
+          Truth
+Prediction  Low Medium High
+    Low    2935    336    8
+    Medium  629   2133  499
+    High     33    632 2471
+```
+
+Konfúzna matica (confusion matrix) ukazuje pre každú kombináciu (predikovaná trieda × skutočná trieda) počet pozorovaní. **Diagonála** = správne klasifikácie. Mimo diagonály = chyby.
+
+**Čo vidíme:**
+- Väčšina chýb je medzi **susednými triedami** (Low↔Medium, Medium↔High)
+- Len 8 vozidiel: predikované Low, skutočné High (a 33 opačne) — extrémne chyby sú vzácne
+- Medium trieda má najviac chýb (629 + 499 = 1128 chybne klasifikovaných z 3103)
+
+> **📚 Poučka: Čo konfúzna matica hovorí o type chýb**
+>
+> Nie všetky chyby sú rovnako závažné. Pre MPG klasifikáciu:
+> - Low predikovaný ako High (8 prípadov) = hovorím, že auto je efektívne, ale v skutočnosti je neefektívne → **veľká chyba** (napr. zákazník by bol sklamaný)
+> - Low predikovaný ako Medium (336 prípadov) = menší omyl, triedy sú susedné
+>
+> V iných doménach (napr. lekárska diagnostika) by zámerné asymetrické penalizovanie chýb viedlo k použitiu **cost-sensitive** klasifikátorov. Pre naše akademické účely postačuje macro accuracy.
+
+**Per-class accuracy:**
+
+| Trieda | n | Správne | Accuracy |
+|--------|---|---------|----------|
+| Low | 3 605 | 2 935 | 81.4% |
+| Medium | 3 103 | 2 133 | 68.8% |
+| High | 2 978 | 2 471 | 83.0% |
+
+Medium je najťažšia trieda — 4 MPG šírka koridoru (18–22 MPG) spôsobuje, že vozidlá pri hraniciach sú takmer nerozlíšiteľné.
+
+---
+
+### 8.9 Výsledky a záver — Scenario 5
+
+#### Redukcia dimenzionality: výsledok
+
+LD1 zachytáva 98.2% celkovej separácie medzi triedami. Dáta sú takmer dokonale separovateľné **v jednej dimenzii** — lineárna kombinácia motorových parametrov (displ, cylinders, has_discrete_gears, FWD, n_gears) dokáže takmer sama o sebe zaradiť vozidlo do správnej efektívnostnej triedy.
+
+Toto je konzistentné so Scenárom 2: aj tam dominovali `cylinders` a `displ`. Oba scenáre konvergujú k rovnakému záveru — MPG efektívnosť je primárne určená veľkosťou motora.
+
+#### Klasifikačná výkonnosť: záver
+
+| Metrika | Hodnota |
+|---------|---------|
+| CV Accuracy | 77.5% ± 0.09% |
+| Test Accuracy | 77.9% |
+| CV–Test gap | 0.4 pp (žiadny overfitting) |
+| Najťažšia trieda | Medium (68.8%) |
+| Najľahšia trieda | High (83.0%) |
+
+**Vhodnosť LDA pre tento problém:**
+LDA je vhodný model. Separácia tried je takmer lineárna (LD1 dominuje), prediktory sú numericky normalizované a triedy sú relatívne vyvážené. 77.9% accuracy pri 3 triedach (baseline: 33%) potvrdzuje, že fyzikálne vlastnosti motora naozaj predikujú efektívnostnú triedu.
+
+**Obmedzenia:**
+1. Tertilové hranice (18 MPG, 22 MPG) sú arbitrárne — Medium trieda je umelo zúžená, čo znižuje jej accuracy
+2. LDA predpokladá lineárne hranice — vozidlá blízko hraníc (17–19 MPG, 21–23 MPG) sú štrukturálne ťažko klasifikovateľné bez nelineárneho rozhodovacieho pravidla
+3. Porovnanie so Scenárom 2: RMSE 3.36 MPG je väčší ako šírka Medium triedy (4 MPG) — regresný model by tiež chyboval pri hraničných prípadoch
+
+---
+
+### 8.10 Slovník príkazov Scenára 5
+
+#### `quantile()`
+
+```r
+quantile(vehicles_model$comb08, probs = c(0, 1/3, 2/3, 1))
+```
+
+Vypočíta kvantily vektora. `probs` definuje, ktoré percentily chceme. Výsledok: named vector kde mená sú percentily a hodnoty sú zodpovedajúce hodnoty z distribúcie.
+
+#### `cut()`
+
+```r
+cut(comb08, breaks = cuts, labels = c("Low", "Medium", "High"), include.lowest = TRUE)
+```
+
+Diskretizuje spojitý vektor do intervalov. `breaks` definuje hranice, `labels` názvy tried. Vracia faktor. `include.lowest = TRUE` zahrnie minimum do prvého intervalu (bez toho by `x == min(breaks)` dalo `NA`).
+
+#### `discrim_linear()` z balíka `discrim`
+
+```r
+library(discrim)
+lda_spec <- discrim_linear() %>% set_engine("MASS") %>% set_mode("classification")
+```
+
+Tidymodels interface pre lineárnu diskriminačnú analýzu. `set_engine("MASS")` špecifikuje backend — balík MASS, funkcia `lda()`. Analóg `linear_reg()` pre regresnú úlohu.
+
+#### `extract_fit_parsnip()` a `pluck()`
+
+```r
+mass_lda <- lda_fit %>% extract_fit_parsnip() %>% pluck("fit")
+```
+
+Dvojkroková extrakcia interného modelu z workflow:
+1. `extract_fit_parsnip(lda_fit)` — vyberie parsnip wrapper objekt
+2. `pluck("fit")` — extrahuje pôvodný MASS lda objekt uložený pod kľúčom `"fit"`
+
+`pluck()` je z balíka `purrr` (tidyverse) — bezpečný prístup k prvkom listu. `pluck(x, "fit")` je ekvivalent `x[["fit"]]`, ale neskrachuje pri chýbajúcom kľúči.
+
+#### `prep()` a `bake()` — manuálna aplikácia recipe
+
+```r
+prepped     <- prep(lda_recipe, training = lda_train)
+train_baked <- bake(prepped, new_data = lda_train)
+test_baked  <- bake(prepped, new_data = lda_test)   # rovnaké škály ako z train!
+```
+
+- `prep(recipe, training = data)` — "naučí" recipe: vypočíta mediány, škály, dummy úrovne z trénovacích dát
+- `bake(prepped, new_data = X)` — aplikuje naučené transformácie na X. Kľúčové: test bake používa *trénovacie škály* — toto zabraňuje data leakage
+
+#### `predict(mass_lda, newdata = ...)` — MASS lda výstup
+
+```r
+lda_proj <- predict(mass_lda, newdata = select(train_baked, -efficiency_class))
+# $class     — predikované triedy (factor)
+# $posterior — matica posteriórnych pravdepodobností (n × K)
+# $x         — matica LD súradníc (n × (K-1))
+```
+
+MASS `predict()` vracia **list** (nie tibble). `$x` obsahuje projekcie na diskriminačné osi — to sú hodnoty potrebné pre vizualizáciu redukcie dimenzionality.
+
+#### `stat_ellipse()` v ggplot2
+
+```r
+stat_ellipse(level = 0.95, linewidth = 1.2)
+```
+
+Pridá do grafu elipsu spoľahlivosti. `level = 0.95` nakreslí oblasť, v ktorej by ležalo 95% nových pozorovaní z rovnakej distribúcie (za predpokladu bivariátnej normality). Automaticky sa počíta zvlášť pre každú skupinu definovanú `aes(color = ...)` alebo `aes(group = ...)`.
+
+#### `accuracy()`, `precision()`, `recall()` z `yardstick`
+
+```r
+accuracy(data, truth = truth, estimate = pred)
+precision(data, truth = truth, estimate = pred, estimator = "macro")
+recall(data,    truth = truth, estimate = pred, estimator = "macro")
+```
+
+Funkcie z balíka `yardstick` (súčasť tidymodels). Pre multitriednu klasifikáciu:
+- `accuracy()` — nevyžaduje `estimator` (je rovnaká bez ohľadu na averaging)
+- `precision()` a `recall()` — vyžadujú `estimator`:
+  - `"macro"` — aritmetický priemer cez triedy (rovnaká váha)
+  - `"macro_weighted"` — vážený priemer podľa veľkosti tried
+  - `"micro"` — agregovanie TP/FP/FN cez všetky triedy naraz
+
+Všetky vracajú tibble so stĺpcom `.estimate` obsahujúcim hodnotu metriky.
+
+#### `conf_mat()` a `autoplot()`
+
+```r
+cm <- conf_mat(lda_test_pred, truth = truth, estimate = pred)
+print(cm)                          # textová matica
+autoplot(cm, type = "heatmap")     # grafická heatmapa
+```
+
+`conf_mat()` vytvorí konfúznú maticu ako špeciálny objekt triedy `conf_mat`. `autoplot()` s `type = "heatmap"` zobrazí maticu ako farebný grid, kde farba kóduje počet pozorovaní — tmavšia = viac prípadov.
 
 ---
 
