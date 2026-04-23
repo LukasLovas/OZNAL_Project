@@ -525,11 +525,14 @@ table(data_fe$VClass)
 
 #### `trany` — Extract Structured Transmission Features
 
-Instead of keeping the raw high-cardinality `trany` string, we extract three interpretable features:
+Instead of keeping the raw high-cardinality `trany` string, we extract four interpretable features:
 
 - `transmission_type`: "Automatic", "Manual", or "Other"
 - `is_cvt`: TRUE if the transmission uses continuously variable gear ratios
-- `n_gears`: number of speeds extracted from text (NA for non-standard transmissions)
+- `n_gears`: number of speeds extracted from text; 0 means "not applicable" (CVT or non-standard transmission)
+- `has_discrete_gears`: TRUE if the number of gear steps was successfully extracted from `trany`
+
+`has_discrete_gears` and `n_gears` are designed to be read together: `has_discrete_gears = FALSE` means a CVT or other transmission without a discrete gear count — this is not randomly missing data, but a structural property of the transmission. Setting `n_gears = 0` via `replace_na` provides a numeric sentinel that is safe to use in models without median imputation.
 
 The raw `trany` column is then removed.
 
@@ -543,7 +546,9 @@ data_fe <- data_fe %>%
     ),
     is_cvt  = str_detect(trany, regex("variable gear ratios", ignore_case = TRUE)),
     is_cvt  = replace_na(is_cvt, FALSE),
-    n_gears = as.integer(str_match(trany, "(\\d+)-spd")[, 2])
+    n_gears = as.integer(str_match(trany, "(\\d+)-spd")[, 2]),
+    has_discrete_gears = !is.na(n_gears),
+    n_gears = replace_na(n_gears, 0)
   )
 
 cat("Transmission type distribution:\n")
@@ -551,6 +556,8 @@ print(table(data_fe$transmission_type))
 cat("\nCVT vehicles:", sum(data_fe$is_cvt), "\n")
 cat("\nn_gears summary:\n")
 print(summary(data_fe$n_gears))
+cat("\nhas_discrete_gears distribution:\n")
+print(table(data_fe$has_discrete_gears))
 ```
 
 ### Build Final Modeling Dataset
@@ -656,8 +663,7 @@ The recipe is defined on `train_data` and fitted only on the training set to pre
 
 - `step_unknown()` — handles unseen factor levels that may appear in the test set
 - `step_other()` — collapses any residual rare categories below 1%
-- `step_impute_median()` — fills remaining numeric NAs with training-set medians (e.g., non-EV rows with missing `displ`)
-- `step_impute_mode()` — fills remaining nominal NAs with training-set modes
+- `step_impute_median(displ, cylinders)` — fills the small number of numeric NAs in engine parameters for non-BEV rows; `n_gears` is intentionally set to 0 in feature engineering and does not need imputation
 - `step_dummy()` — one-hot encodes all nominal predictors; required by linear regression methods
 - `step_zv()` / `step_nzv()` — removes zero- and near-zero-variance columns, consistent with EDA findings on low-variability variables
 - `step_normalize()` — standardizes all numeric predictors; required for ridge, lasso, elastic net, kNN, and PCA/PCR/PLS
@@ -666,8 +672,7 @@ The recipe is defined on `train_data` and fitted only on the training set to pre
 model_recipe <- recipe(comb08 ~ ., data = train_data) %>%
   step_unknown(all_nominal_predictors()) %>%
   step_other(all_nominal_predictors(), threshold = 0.01) %>%
-  step_impute_median(all_numeric_predictors()) %>%
-  step_impute_mode(all_nominal_predictors()) %>%
+  step_impute_median(displ, cylinders) %>%
   step_dummy(all_nominal_predictors()) %>%
   step_zv(all_predictors()) %>%
   step_nzv(all_predictors()) %>%

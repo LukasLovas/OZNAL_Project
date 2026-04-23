@@ -231,7 +231,10 @@ transmission_type = case_when(
   TRUE                                                       ~ "Other"
 ),
 is_cvt  = str_detect(trany, regex("variable gear ratios", ignore_case = TRUE)),
-n_gears = as.integer(str_match(trany, "(\\d+)-spd")[, 2])
+is_cvt  = replace_na(is_cvt, FALSE),
+n_gears = as.integer(str_match(trany, "(\\d+)-spd")[, 2]),
+has_discrete_gears = !is.na(n_gears),
+n_gears = replace_na(n_gears, 0)
 ```
 
 - **`str_detect(text, pattern)`** — vráti TRUE/FALSE, či reťazec obsahuje daný vzor (regulárny výraz)
@@ -249,7 +252,11 @@ as.integer("6") → 6
 Výsledky feature engineering:
 - `transmission_type`: Automatic (36 548), Manual (13 287), Other (11)
 - `is_cvt`: 1 201 vozidiel s CVT
-- `n_gears`: medián 5, max 10, 13 723 NA (CVT a iné nemajú diskrétny počet rýchlostí)
+- `n_gears`: hodnoty 1–10, kde 0 = "not applicable" (CVT alebo prevodovky bez diskrétneho počtu stupňov)
+- `has_discrete_gears`: TRUE = počet stupňov bol vyčítaný z `trany`; FALSE = CVT alebo špeciálna prevodovka
+
+**Prečo `n_gears = NA` nie je náhodná chýbajúca hodnota:**
+CVT (continuously variable transmission) a niektoré automatické prevodovky nemajú diskrétny počet rýchlostných stupňov — vzorec `"\\d+-spd"` jednoducho nie je v ich popise. To, že `str_match()` nič nenájde, nie je náhoda ani chyba záznamu. Ide o štrukturálnu vlastnosť prevodovky. Preto `n_gears` nenahradzujeme mediánom — to by zavádzalo falošnú informáciu, akoby CVT malo napr. 5 stupňov. Namiesto toho `has_discrete_gears` explicitne zachytáva túto skutočnosť a `n_gears = 0` slúži ako technický kód pre "not applicable", ktorý sa má čítať spolu s `has_discrete_gears`.
 
 ### 3.2 Vylúčenie elektrických vozidiel
 
@@ -321,16 +328,61 @@ Fold 5: [Train: 1,2,3,4] [Validate: 5]
 >
 > **Prečo 5 foldov?** Je to štandard. Viac foldov (napr. 10) dáva presnejší odhad, ale trvá dlhšie. Pri >10 000 vzorkách je 5-fold dostatočné.
 
+#### Ako presne prebieha ladenie hyperparametra `penalty`
+
+V našom projekte sa `penalty` neladí podľa test setu ani podľa jedného "najlepšieho" foldu. Pre každú kandidátnu hodnotu `penalty` sa spustí celá 5-fold cross-validácia:
+
+1. Model sa natrénuje na 4 foldoch a vyhodnotí na 1 validačnom folde.
+2. Toto sa zopakuje 5-krát, aby každý fold bol raz validačný.
+3. Z piatich validačných výsledkov sa vypočíta priemerné RMSE.
+4. Rovnaký proces sa zopakuje pre všetky hodnoty `penalty` v gride.
+5. Vyberie sa tá `penalty`, ktorá má najnižšie priemerné CV RMSE.
+
+Schématicky:
+
+```text
+penalty = 0.0001:
+  fold 1 validate RMSE
+  fold 2 validate RMSE
+  fold 3 validate RMSE
+  fold 4 validate RMSE
+  fold 5 validate RMSE
+  -> priemer RMSE
+
+penalty = 0.001:
+  fold 1 validate RMSE
+  fold 2 validate RMSE
+  fold 3 validate RMSE
+  fold 4 validate RMSE
+  fold 5 validate RMSE
+  -> priemer RMSE
+
+...
+
+vyberie sa penalty s najnižším priemerným RMSE
+```
+
+Dôležitý detail: finálny model sa potom **netrénuje na jednom najlepšom folde**. Po výbere najlepšej `penalty` sa model natrénuje nanovo na **celom `train_data`**:
+
+```r
+best_ridge <- ridge_cv %>% select_best(metric = "rmse")
+ridge_final_wf <- ridge_wf %>% finalize_workflow(best_ridge)
+ridge_fit <- ridge_final_wf %>% fit(data = train_data)
+```
+
+Test set (`test_data`) sa použije až po tomto kroku — na finálne vyhodnotenie už natrénovaného modelu.
+
 ### 3.5 Preprocessing Recipe
 
-Recipe definuje sériu transformačných krokov. Kľúčová vlastnosť: **naučí sa parametre (mediány, mody, škály) iba z trénovacej sady** — potom ich aplikuje rovnako na trénovaciu aj testovaciu sadu.
+Recipe definuje sériu transformačných krokov, ktoré sa majú aplikovať na dáta pred modelovaním. Je to "recept" na preprocessing: najprv povie, čo sa má spraviť, a až pri `prep()` sa z trénovacích dát naučia konkrétne hodnoty ako mediány, módy, dummy úrovne alebo priemery a smerodajné odchýlky.
+
+Kľúčová vlastnosť: **všetky naučené parametre preprocessingu sa počítajú iba z trénovacej sady**. Potom sa tie isté uložené hodnoty aplikujú na train aj test. Takto sa zabraňuje data leakage, pretože testovací set neovplyvní imputáciu, normalizáciu ani výber dummy úrovní.
 
 ```r
 model_recipe <- recipe(comb08 ~ ., data = train_data) %>%
   step_unknown(all_nominal_predictors()) %>%
   step_other(all_nominal_predictors(), threshold = 0.01) %>%
-  step_impute_median(all_numeric_predictors()) %>%
-  step_impute_mode(all_nominal_predictors()) %>%
+  step_impute_median(displ, cylinders) %>%
   step_dummy(all_nominal_predictors()) %>%
   step_zv(all_predictors()) %>%
   step_nzv(all_predictors()) %>%
@@ -339,16 +391,77 @@ model_recipe <- recipe(comb08 ~ ., data = train_data) %>%
 
 `recipe(comb08 ~ ., data = train_data)` — definuje vzorec: `comb08` je výstup, `.` znamená "všetky ostatné stĺpce sú prediktory". `data = train_data` sa používa len na určenie názvov a typov stĺpcov — dáta sa ešte nespracúvajú.
 
-| Krok | Čo robí | Prečo |
-|------|---------|-------|
-| `step_unknown()` | Neznáme kategórie → špeciálna úroveň "unknown" | Testovací set obsahuje vzácne značky áut neviděné v train |
-| `step_other(threshold=0.01)` | Kategórie s <1% výskytom → "other" | Redukcia počtu dummy premenných, menej šumu |
-| `step_impute_median()` | NA v číselných → medián z train sady | `n_gears` má 13 723 NA (CVT, iné špeciálne prevodovky) |
-| `step_impute_mode()` | NA v kategorických → móda z train sady | Malý počet NA v `drive`, `make` |
-| `step_dummy()` | Kategórie → binárne 0/1 stĺpce | Lineárna regresia pracuje len s číslami |
-| `step_zv()` | Odstráni stĺpce s nulovou variabilitou | Konštantný stĺpec nepomáha pri predikcii |
-| `step_nzv()` | Odstráni stĺpce s takmer nulovou variabilitou | Napr. kategória kde 99.5% hodnôt je rovnakých |
-| `step_normalize()` | Štandardizácia: odčíta priemer, vydelí SD | **Nevyhnutné pre Ridge/LASSO/Elastic Net** |
+#### Odkiaľ sú tieto `step_*` kroky?
+
+Tieto funkcie sú z balíka **`recipes`**, ktorý je súčasťou ekosystému **tidymodels**. V našom `vehicles_EDA.Rmd` sa balík načíta cez:
+
+```r
+library(recipes)
+```
+
+V `sources/Tutorials` je spomenutý všeobecný koncept: balík `recipes` umožňuje skladať preprocessing ako postupnosť pipeovateľných feature-engineering krokov a `workflows` potom spája recipe s modelom. Konkrétna kombinácia `step_unknown()`, `step_other()`, `step_impute_*()`, `step_dummy()`, `step_zv()`, `step_nzv()` a `step_normalize()` však v tutorialoch nie je nadiktovaná ako hotový blok. Je to štandardná tidymodels preprocessing pipeline zvolená podľa toho, čo naše dáta a modely potrebujú:
+
+- máme kategorické premenné (`make`, `VClass`, `drive`, `fuel_group`, `transmission_type`),
+- máme zriedkavé kategórie,
+- máme chýbajúce hodnoty,
+- používame lineárne modely, ktoré potrebujú numerické vstupy,
+- používame Ridge/LASSO/Elastic Net, pri ktorých je dôležitá spoločná mierka numerických prediktorov.
+
+Inými slovami: AI pri generovaní kódu pravdepodobne neprebralo tento presný blok z jedného tutorialu, ale poskladalo bežné kroky z balíka `recipes` podľa typických pravidiel pre tidymodels a podľa problémov viditeľných v EDA.
+
+#### Čo robí každý krok
+
+**`step_unknown(all_nominal_predictors())`**
+
+Nominal predictors sú kategorické prediktory, teda premenné ako značka auta, trieda vozidla, typ pohonu alebo typ paliva. Tento krok rieši chýbajúce hodnoty v kategóriách tak, že im vytvorí samostatnú úroveň `"unknown"`.
+
+Prečo je to dôležité: model potom nestratí riadky len preto, že niektorá kategória chýba. Pri autách môže chýbať napríklad informácia o pohone alebo prevodovke. Namiesto vyhodenia pozorovania model dostane signál: "táto kategória nebola známa".
+
+**`step_other(all_nominal_predictors(), threshold = 0.01)`**
+
+Tento krok spojí veľmi zriedkavé kategórie do jednej kategórie `"other"`. Hodnota `threshold = 0.01` znamená, že úrovne s výskytom pod približne 1 % sa zlúčia.
+
+Prečo je to dôležité: ak by sme nechali všetky vzácne značky alebo triedy áut samostatne, po dummy encodingu by vzniklo veľa stĺpcov s veľmi málo jednotkami. Takéto premenné sú nestabilné, môžu pridávať šum a zbytočne komplikujú model. Zlúčenie do `"other"` znižuje dimenziu a robí model robustnejší.
+
+**`step_impute_median(displ, cylinders)`**
+
+Tento krok dopĺňa chýbajúce hodnoty v `displ` a `cylinders` mediánom vypočítaným z trénovacej sady. Po vyfiltrovaní BEV ostáva malé množstvo reálne chýbajúcich hodnôt v týchto prediktoroch pre niektoré non-BEV riadky (napr. záznamy bez nameraného objemu motora).
+
+`n_gears` sa mediánom nenahrádza — jeho chýbajúce hodnoty nie sú náhodné, ale signalizujú CVT alebo prevodovky bez diskrétneho počtu stupňov. Táto informácia je explicitne zachytená v `has_discrete_gears` a `n_gears` je nastavené na 0 vo feature engineeringu. Imputovať ho mediánom by zavádzalo falošnú informáciu.
+
+Prečo medián: medián je odolnejší voči extrémnym hodnotám než priemer. Pri automobilových dátach môžu mať niektoré numerické premenné šikmé rozdelenie alebo extrémy, takže medián je konzervatívnejšia voľba.
+
+**Prečo nie `step_impute_mode(all_nominal_predictors())`**
+
+`step_impute_mode()` sme z recipe odstránili z troch dôvodov:
+
+1. `step_unknown()` už rieši chýbajúce nominálne hodnoty — vytvorí pre ne samostatnú kategóriu `"unknown"`, čo je informatívnejšie ako falošná imputácia.
+2. Veľa kategorických features má vlastný fallback vo feature engineeringu: `drive` → `"Unknown"`, `fuel_group` → `"Other"`, `transmission_type` → `"Other"`, `VClass` → `"Other"`.
+3. Pre technické kategorické vlastnosti je lepšie zachovať `"Unknown"` než imputovať najčastejšiu kategóriu — imputácia módom by zavádzala falošnú informáciu, akoby vozidlo patrilo do najčastejšej triedy pohonu alebo paliva.
+
+**`step_dummy(all_nominal_predictors())`**
+
+Tento krok zmení kategorické premenné na binárne 0/1 stĺpce. Napríklad `transmission_type = Automatic/Manual/Other` sa prevedie na dummy premenné reprezentujúce jednotlivé kategórie.
+
+Prečo je to nutné: lineárna regresia, Ridge, LASSO aj Elastic Net pracujú s číselnou maticou prediktorov. Textové kategórie ako `"Manual"` alebo `"Compact Cars"` model priamo nevie použiť.
+
+**`step_zv(all_predictors())`**
+
+`zv` znamená zero variance. Tento krok odstráni prediktory, ktoré majú vo všetkých riadkoch rovnakú hodnotu.
+
+Prečo je to dôležité: konštantný stĺpec nemôže vysvetľovať rozdiely v `comb08`, lebo sa nemení. Taký prediktor neprináša informáciu a môže zhoršovať numerickú stabilitu modelu.
+
+**`step_nzv(all_predictors())`**
+
+`nzv` znamená near-zero variance. Tento krok odstráni prediktory, ktoré síce nie sú úplne konštantné, ale takmer všetky hodnoty sú rovnaké.
+
+Príklad: dummy premenná, ktorá je `0` v 99.5 % riadkov a `1` len v pár prípadoch. Taký stĺpec často vzniká zo vzácnych kategórií a modelu dáva veľmi slabý alebo nestabilný signál. Tento krok je v súlade s EDA, kde sa riešili nízkovariačné premenné.
+
+**`step_normalize(all_numeric_predictors())`**
+
+Tento krok štandardizuje numerické prediktory: odčíta priemer a vydelí smerodajnou odchýlkou. Po normalizácii majú numerické prediktory približne priemer 0 a smerodajnú odchýlku 1.
+
+Prečo je to dôležité: Ridge, LASSO a Elastic Net penalizujú veľkosť koeficientov. Ak by jeden prediktor mal rozsah 1984-2026 (`year`) a iný 4-16 (`cylinders`), penalizácia by nebola férová. Normalizácia zabezpečí, že koeficienty sú penalizované porovnateľne.
 
 > **📚 Poučka: Prečo je normalizácia nevyhnutná pre regularizované modely**
 >
@@ -541,6 +654,8 @@ ridge_spec <- linear_reg(penalty = tune(), mixture = 0) %>%
 ridge_grid <- grid_regular(penalty(range = c(-4, 2)), levels = 50)
 ```
 
+Tu sú definované konkrétne hodnoty `penalty`, ktoré sa budú skúšať. `penalty = tune()` v modeli len hovorí "toto je hyperparameter, treba ho nájsť"; samotné kandidátne hodnoty dodáva až `ridge_grid`.
+
 - **`grid_regular()`** — vytvorí rovnomerne rozmiestnené hodnoty **na log-škále**
 - `range = c(-4, 2)` → $10^{-4}$ až $10^2$ = 0.0001 až 100
 - `levels = 50` → 50 hodnôt λ na otestovanie
@@ -564,6 +679,8 @@ ridge_fit      <- ridge_final_wf %>% fit(data = train_data)
 - **`select_best(metric = "rmse")`** — nájde riadok s najlepšou (najnižšou) priemernou CV RMSE
 - **`finalize_workflow(best_ridge)`** — dosadí konkrétnu hodnotu penalty do workflow (namiesto `tune()`)
 - **`fit(data = train_data)`** — natrénuje finálny model na celom trénovacom sete
+
+Pre Ridge teda prebehne približne **50 penalty hodnôt × 5 foldov = 250 validačných behov**. Nevyberá sa najlepší jeden fold, ale najlepšia `penalty` podľa priemeru RMSE cez všetkých 5 validačných foldov.
 
 #### Výsledky
 
@@ -611,7 +728,12 @@ lasso_grid <- grid_regular(penalty(range = c(-4, 0)), levels = 50)
 ```
 
 - **`mixture = 1`** — čistá L1 penalizácia (LASSO)
-- Narrower grid `c(-4, 0)` (0.0001–1.0) vs Ridge `c(-4, 2)` (0.0001–100): LASSO typicky achieves sufficient shrinkage at smaller λ values
+- `lasso_grid` definuje konkrétne hodnoty `penalty`, ktoré sa skúšajú pri tuningu.
+- `range = c(-4, 0)` znamená $10^{-4}$ až $10^0$, teda 0.0001 až 1.
+- `levels = 50` znamená 50 hodnôt `penalty`.
+- Tento grid je užší ako pri Ridge (`0.0001` až `100`), pretože LASSO typicky dosahuje dostatočné zmršťovanie koeficientov už pri menších hodnotách λ.
+
+Aj tu platí rovnaký mechanizmus: pre každú z 50 hodnôt `penalty` sa spraví 5-fold CV, vypočíta sa priemerné RMSE a `select_best(metric = "rmse")` vyberie hodnotu s najnižším priemerným CV RMSE. Až potom sa finálny LASSO model natrénuje na celom `train_data`.
 
 #### Výsledky
 
@@ -659,6 +781,14 @@ en_grid <- grid_regular(
 ```
 
 `grid_regular()` s dvoma parametrami vytvorí **10 × 10 = 100 kombinácií**. `glmnet` ich vyhodnotí efektívne — pre každú hodnotu `mixture` vypočíta celý regularizačný path (všetky `penalty`) naraz.
+
+Konkrétne:
+
+- `penalty(range = c(-4, 0))` → 10 hodnôt od 0.0001 po 1
+- `mixture(range = c(0, 1))` → 10 hodnôt od 0 po 1
+- spolu sa skúša 100 dvojíc `(penalty, mixture)`
+
+Pre každú dvojicu `(penalty, mixture)` sa znovu spraví 5-fold CV. Elastic Net teda porovnáva priemerné CV RMSE pre 100 konfigurácií a vyberie tú najlepšiu. V našom výsledku to bola kombinácia `penalty = 0.0001` a `mixture = 0.222`.
 
 #### Výsledky
 
