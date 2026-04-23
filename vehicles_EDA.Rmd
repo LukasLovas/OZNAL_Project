@@ -7,7 +7,8 @@ output: html_document
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE)
-setwd("D:/Škola/Ing/2.semester/OZNAL_projekt")
+#setwd("D:/Škola/Ing/2.semester/OZNAL_projekt")
+setwd("C:/school/oznal/OZNAL_Project")
 ```
 
 ## EDA
@@ -20,11 +21,13 @@ Based on the column descriptions, we could potentially predict fuel consumption 
 -   **MPG (Miles per gallon)** – a measure of fuel economy in automobiles, higher number= higher efficiency\
 -   **Target variable:** `comb08`
 
-```{r}
+```{r message=FALSE, warning=FALSE}
 library(tidyverse)
 library(ggcorrplot)
 library(patchwork)
+```
 
+```{r}
 rm(list = ls())
 data <- read_csv("data/vehicles.csv")
 data
@@ -421,10 +424,10 @@ cols_sparse_or_invalid <- c(
 
 #### Unused Columns
 
-- `eng_dscr` has ~37% missing values and is a free-text engine description — not suitable for standard regression without NLP.
-- `createdOn` and `modifiedOn` are administrative metadata with no predictive value.
-- `baseModel` has high cardinality and would support memorization of specific model lines rather than generalization.
-- `fuelType` and `fuelType1` are replaced by the new `fuel_group` variable and removed from `vehicles_model` via an explicit `select()`. The raw columns remain intact in the original `data` object.
+-   `eng_dscr` has \~37% missing values and is a free-text engine description — not suitable for standard regression without NLP.
+-   `createdOn` and `modifiedOn` are administrative metadata with no predictive value.
+-   `baseModel` has high cardinality and would support memorization of specific model lines rather than generalization.
+-   `fuelType` and `fuelType1` are replaced by the new `fuel_group` variable and removed from `vehicles_model` via an explicit `select()`. The raw columns remain intact in the original `data` object.
 
 ```{r}
 cols_unused <- c("createdOn", "modifiedOn", "eng_dscr", "baseModel")
@@ -443,8 +446,8 @@ cat("Total columns scheduled for removal:", length(cols_to_remove), "\n")
 
 Electric vehicles do not have a combustion engine and therefore have no `displ` or `cylinders`. Their missing values are structurally meaningful — they signal the absence of an engine, not random data loss. We capture this before any imputation.
 
-- `is_electric`: TRUE if the vehicle runs on electricity only.
-- `has_combustion_engine`: TRUE if the vehicle has a combustion engine.
+-   `is_electric`: TRUE if the vehicle runs on electricity only.
+-   `has_combustion_engine`: TRUE if the vehicle has a combustion engine.
 
 For EVs, `displ` and `cylinders` are set to 0 — meaning zero displacement, not a statistical fill-in. Remaining missing values in non-EV rows will be handled later by the recipe.
 
@@ -529,9 +532,9 @@ table(data_fe$VClass)
 
 Instead of keeping the raw high-cardinality `trany` string, we extract three interpretable features:
 
-- `transmission_type`: "Automatic", "Manual", or "Other"
-- `is_cvt`: TRUE if the transmission uses continuously variable gear ratios
-- `n_gears`: number of speeds extracted from text (NA for non-standard transmissions)
+-   `transmission_type`: "Automatic", "Manual", or "Other"
+-   `is_cvt`: TRUE if the transmission uses continuously variable gear ratios
+-   `n_gears`: number of speeds extracted from text (NA for non-standard transmissions)
 
 The raw `trany` column is then removed.
 
@@ -569,7 +572,7 @@ cat("\nColumns retained:\n")
 print(names(vehicles_model))
 ```
 
-`cylinders` is kept as a candidate predictor despite its strong correlation with `displ` (~0.91). We expect multicollinearity, but the final decision on whether to drop it is deferred to feature selection in a later scenario.
+`cylinders` is kept as a candidate predictor despite its strong correlation with `displ` (\~0.91). We expect multicollinearity, but the final decision on whether to drop it is deferred to feature selection in a later scenario.
 
 ### Sanity Checks
 
@@ -649,13 +652,13 @@ print(folds)
 
 The recipe is defined on `train_data` and fitted only on the training set to prevent leakage of test statistics into training:
 
-- `step_unknown()` — handles unseen factor levels that may appear in the test set
-- `step_other()` — collapses any residual rare categories below 1%
-- `step_impute_median()` — fills remaining numeric NAs with training-set medians (e.g., non-EV rows with missing `displ`)
-- `step_impute_mode()` — fills remaining nominal NAs with training-set modes
-- `step_dummy()` — one-hot encodes all nominal predictors; required by linear regression methods
-- `step_zv()` / `step_nzv()` — removes zero- and near-zero-variance columns, consistent with EDA findings on low-variability variables
-- `step_normalize()` — standardizes all numeric predictors; required for ridge, lasso, elastic net, kNN, and PCA/PCR/PLS
+-   `step_unknown()` — handles unseen factor levels that may appear in the test set
+-   `step_other()` — collapses any residual rare categories below 1%
+-   `step_impute_median()` — fills remaining numeric NAs with training-set medians (e.g., non-EV rows with missing `displ`)
+-   `step_impute_mode()` — fills remaining nominal NAs with training-set modes
+-   `step_dummy()` — one-hot encodes all nominal predictors; required by linear regression methods
+-   `step_zv()` / `step_nzv()` — removes zero- and near-zero-variance columns, consistent with EDA findings on low-variability variables
+-   `step_normalize()` — standardizes all numeric predictors; required for ridge, lasso, elastic net, kNN, and PCA/PCR/PLS
 
 ```{r}
 model_recipe <- recipe(comb08 ~ ., data = train_data) %>%
@@ -702,3 +705,674 @@ print(head(names(train_processed), 10))
 ```
 
 Both processed datasets contain no missing values in predictors, and `comb08` is retained as the regression target. The objects `vehicles_model`, `train_data`, `test_data`, `folds`, `model_recipe`, `prep_recipe`, `train_processed`, and `test_processed` are ready for regression scenarios 2, 3, and 5.
+
+## Non-parametric regression methods
+
+```{r message=FALSE, warning=FALSE}
+library(tidymodels)
+library(rpart)       #for Decision tree
+library(rpart.plot)  # decision tree visualisation
+library(ranger)      # for Random forest
+library(randomForest) # for Random forest
+library(kknn)        # for KNN
+library(vip)
+library(parsnip)
+```
+
+Variables used for hyperparameters tuning:
+```{r}
+tune_ctrl <- control_grid(
+  save_pred    = TRUE,
+  save_workflow = TRUE,
+  verbose      = TRUE
+)
+
+metrics_set <- metric_set(rmse, rsq, mae)
+```
+
+### Decision tree
+
+Firstly, we will create decision tree model. The decision tree algorithm doesnt need normalised data, however we will use the prepared recipe with a normalisation step.
+
+We will create a model with random parameters and then we will find the best model using hyperparameters tuning.
+```{r}
+dt_model <- decision_tree(
+  cost_complexity = 0.1,
+  tree_depth      = 10,
+  min_n           = 5
+) %>%
+  set_engine("rpart") %>%
+  set_mode("regression")
+
+dt_wf <- workflow() %>%
+  add_recipe(model_recipe) %>%
+  add_model(dt_model)
+```
+
+```{r}
+dt_fit <- fit(dt_wf, data = train_data)
+
+dt_preds <- predict(dt_fit, new_data = test_data) %>%
+  bind_cols(test_data %>% select(comb08))
+
+head(dt_preds)
+
+metrics(dt_preds, truth = comb08, estimate = .pred)
+```
+The decision tree model shows a moderate level of predictive performance with its predictions being constant, which suggest that the tree must be quite simple. In terms of performance metrics, the model achieved an RMSE of 6.46, meaning that typical prediction errors are around 6.5 MPG, which is relatively high. The MAE of 4.51 indicates that on average predictions deviate from the true values by about 4.5 MPG.The R² value of 0.77 shows that the model explains approximately 77% of the variability in `comb08`, which is a reasonable fit.
+
+```{r}
+ggplot(dt_preds, aes(x = comb08, y = .pred)) +
+  geom_point(alpha = 0.3) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red") +
+  labs(
+    title = "Decision tree: Actual vs Predicted",
+    x = "Actual comb08",
+    y = "Predicted comb08"
+  ) +
+  theme_minimal()
+
+dt_pred <- dt_preds %>%
+  mutate(residual = comb08 - .pred)
+
+ggplot(dt_pred, aes(x = .pred, y = residual)) +
+  geom_point(alpha = 0.3) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  labs(
+    title = "Residual Plot",
+    x = "Predicted comb08",
+    y = "Residuals"
+  ) +
+  theme_minimal()
+```
+The plots are looking very strange, it seems as if the model only predicted 2 values.
+
+
+Hyperparameters tuning
+```{r}
+dt_spec <- decision_tree(
+  cost_complexity = tune(),   # alpha used for pruning
+  tree_depth      = tune(),
+  min_n           = tune()
+) %>%
+  set_engine("rpart") %>%
+  set_mode("regression")
+
+dt_wf <- workflow() %>%
+  add_recipe(model_recipe) %>%
+  add_model(dt_spec)
+
+dt_grid <- grid_regular(
+  cost_complexity(range = c(-4, -1)),  # log10 scale: 0.0001 - 0.1
+  tree_depth(range = c(3, 15)),
+  min_n(range = c(2, 20)),
+  levels = 4
+)
+```
+
+```{r}
+dt_tune <- tune_grid(
+  dt_wf,
+  resamples = folds,
+  grid      = dt_grid,
+  metrics   = metrics_set,
+  control   = tune_ctrl
+)
+```
+
+```{r}
+show_best(dt_tune, metric = "rmse", n = 5)
+
+autoplot(dt_tune) +
+  labs(title = "Decision Tree - hyperparameters tuning") +
+  theme_minimal()
+
+dt_best <- select_best(dt_tune, metric = "rmse")
+dt_best
+```
+The graph shows, how the models' performance changes with different hyperparameters. Model performance was most sensitive to the cost-complexity parameter, where larger values substantially worsened RMSE and R², indicating underfitting. Deeper trees (depth 7–11) outperformed shallow trees (depth 3), and the minimum node size had only a minor effect on predictive performance.
+
+The best decision tree model has these parameters:
+-   cost_complexity = 1e-04
+-   tree_depth = 15
+-   min_n = 14
+
+```{r}
+dt_final <- dt_wf %>%
+  finalize_workflow(dt_best) %>%
+  fit(data = train_data)
+
+dt_preds <- predict(dt_final, new_data = test_data) %>%
+  bind_cols(test_data %>% select(comb08))
+
+dt_metrics <- dt_preds %>%
+  metrics(truth = comb08, estimate = .pred) %>%
+  mutate(model = "Decision Tree")
+
+head(dt_preds)
+
+dt_metrics
+```
+The tuned Decision Tree achieved solid predictive performance with RMSE = 3.20, MAE = 1.94 and R² = 0.944. Predicted values were close to the observed values. The predicted values are repeating, which is typical for tree-based regression.
+
+
+```{r}
+ggplot(dt_preds, aes(x = comb08, y = .pred)) +
+  geom_point(alpha = 0.3) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red") +
+  labs(
+    title = "Decision tree: Actual vs Predicted",
+    x = "Actual comb08",
+    y = "Predicted comb08"
+  ) +
+  theme_minimal()
+
+dt_pred <- dt_preds %>%
+  mutate(residual = comb08 - .pred)
+
+ggplot(dt_pred, aes(x = .pred, y = residual)) +
+  geom_point(alpha = 0.3) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  labs(
+    title = "Residual Plot",
+    x = "Predicted comb08",
+    y = "Residuals"
+  ) +
+  theme_minimal()
+```
+Based on the actual vs. predicted graph, we can say that the model performs great on standard vehicles, however, it underestimates special vehicles with high MPG.
+
+From the residuals graph, we can tell that residuals are centered around zero for most observations, but residual variance increases for high predicted MPG values. The model does not predict values for electric and hybrid vehicles well. The graph indicates heteroskedasticity in the upper tail of the target distribution.
+
+```{r}
+dt_rpart_model <- dt_final %>%
+  extract_fit_engine()
+
+rpart.plot(
+  dt_rpart_model,
+  type    = 4,
+  extra   = 101,
+  under   = TRUE,
+  fallen.leaves = TRUE,
+  main    = "Decision Tree - tree structure"
+)
+```
+
+```{r}
+dt_final %>%
+  extract_fit_parsnip() %>%
+  vip(num_features = 15) +
+  labs(title = "Feature importance - Decision Tree") +
+  theme_minimal()
+```
+The graph shows 15 most important features, which were used by model to predict target variable. The most important features are `cylinders` and `displ`.
+
+### Random forest
+
+Secondly, we will create random forest model. The random forest algorithm doesnt need normalised data, however we will use the prepared recipe with a normalisation step.
+
+Firstly, we will try to fit a simple model using the `randomForest` engine. However, since our dataset is quite large (40 000 rows) and the `randomForest` engine is training quite slow, we will use a `ranger` engine in hyperparameters tuning steps, because it trains much quicker.
+
+```{r}
+rf_model <- rand_forest(
+  trees = 500,
+  mtry = 10,
+  min_n = 5
+) %>%
+  set_engine("randomForest") %>%
+  set_mode("regression")
+```
+
+```{r}
+rf_workflow <- workflow() %>%
+  add_recipe(model_recipe) %>%
+  add_model(rf_model)
+
+rf_fit <- fit(rf_workflow, data = train_data)
+rf_fit
+```
+
+On the training data, the model achieved a residual mean squared error of 6.83, corresponding to an RMSE of approximately 2.61 MPG. The model explained 96.4% of the variance of target variable indicating strong predictive capability.
+
+```{r}
+rf_pred <- predict(rf_fit, new_data = test_data) %>%
+  bind_cols(test_data %>% select(comb08))
+
+# we will check predictions in the first rows
+head(rf_pred)
+```
+
+The model has a strong predictive performance on the test dataset. Predicted values were close to the observed values, indicating that the model was able to capture the relationship between the predictors and the target variable effectively. For example, actual values such as 27, 25, and 26 MPG were predicted with only small deviations.
+
+```{r}
+metrics(rf_pred, truth = comb08, estimate = .pred)
+```
+
+Based on the evaluation metrics, the model achieved an RMSE of 2.56, meaning that the typical prediction error was approximately 2.6 MPG, which is quite low. The MAE was 1.26, indicating that, on average, predictions differed from the true values by about 1.3 MPG. The model also achieved an R² of 0.9645, meaning that it explained approximately 96.4% of the variability in the target variable. Overall, the results suggest that the random forest model has strong predictive capability.
+
+```{r}
+ggplot(rf_pred, aes(x = comb08, y = .pred)) +
+  geom_point(alpha = 0.3) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red") +
+  labs(
+    title = "Random Forest: Actual vs Predicted",
+    x = "Actual comb08",
+    y = "Predicted comb08"
+  ) +
+  theme_minimal()
+```
+
+Based on the actual vs predicted graph, we can see that the model predicts standard vehicles (bottom left) quite well. However, prediction errors increase for highly efficient vehicles, where the model tends to predict less then actual MPG values.
+
+```{r}
+rf_pred <- rf_pred %>%
+  mutate(residual = comb08 - .pred)
+
+ggplot(rf_pred, aes(x = .pred, y = residual)) +
+  geom_point(alpha = 0.3) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  labs(
+    title = "Residual Plot",
+    x = "Predicted comb08",
+    y = "Residuals"
+  ) +
+  theme_minimal()
+```
+
+Residuals are centered around zero for most observations, but residual variance increases substantially for high predicted MPG values. The model does not predict values for electric and hybrid vehicles well. The graph indicates heteroskedasticity in the upper tail of the target distribution.
+
+Feature importance plot
+```{r}
+rf_fit %>%
+  extract_fit_parsnip() %>%
+  vip(num_features = 20)
+```
+
+The graph shows 20 most important features, which were used by model to predict target. The most important features are `cylinders` and `displ`.
+
+
+We will train another simple model using the `ranger` engine with variable importance based on decrease in node impurity.
+```{r}
+rf_model <- rand_forest(
+  trees = 500,
+  mtry = 10,
+  min_n = 5
+) %>%
+  set_engine("ranger", importance = "impurity") %>%
+  set_mode("regression")
+
+rf_workflow <- workflow() %>%
+  add_recipe(model_recipe) %>%
+  add_model(rf_model)
+
+rf_fit <- fit(rf_workflow, data = train_data)
+rf_fit
+
+rf_pred <- predict(rf_fit, new_data = test_data) %>%
+  bind_cols(test_data %>% select(comb08))
+
+# we will check predictions in the first rows
+head(rf_pred)
+
+metrics(rf_pred, truth = comb08, estimate = .pred)
+
+ggplot(rf_pred, aes(x = comb08, y = .pred)) +
+  geom_point(alpha = 0.3) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red") +
+  labs(
+    title = "Random Forest: Actual vs Predicted",
+    x = "Actual comb08",
+    y = "Predicted comb08"
+  ) +
+  theme_minimal()
+
+rf_pred <- rf_pred %>%
+  mutate(residual = comb08 - .pred)
+
+ggplot(rf_pred, aes(x = .pred, y = residual)) +
+  geom_point(alpha = 0.3) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  labs(
+    title = "Residual Plot",
+    x = "Predicted comb08",
+    y = "Residuals"
+  ) +
+  theme_minimal()
+
+rf_fit %>%
+  extract_fit_parsnip() %>%
+  vip(num_features = 20)
+```
+On the test set, the model reached RMSE = 2.56, MAE = 1.26 and R² = 0.964, meaning that over 96% of the variance in combined fuel economy was explained. Graphs confirm, that the model performs great on standard vehicles, however, it underestimates special vehicles with high MPG. The most important features are `displ` and `cylinders`.
+
+Hyperparameters tuning
+```{r}
+rf_model <- rand_forest(
+  trees = 200,
+  mtry = tune(),
+  min_n = tune()
+) %>%
+  set_engine("ranger", importance = "impurity") %>%
+  set_mode("regression")
+
+rf_workflow <- workflow() %>%
+  add_recipe(model_recipe) %>%
+  add_model(rf_model)
+
+rf_tuned <- tune_grid(
+  rf_workflow,
+  resamples = folds,
+  grid = 3,
+  metrics = metric_set(rmse, rsq)
+)
+```
+
+```{r}
+rf_tuned
+best_params <- select_best(rf_tuned, metric = "rmse")
+
+best_params
+```
+The best random forest model has these parameters:
+-   trees = 200
+-   mtry = 10
+-   min_n = 2
+
+```{r}
+final_rf <- finalize_workflow(rf_workflow, best_params)
+
+rf_fit <- fit(final_rf, data = train_data)
+rf_fit
+```
+
+```{r}
+pred <- predict(rf_fit, new_data = test_data) %>%
+  bind_cols(test_data)
+
+head(pred)
+
+metrics(pred, truth = comb08, estimate = .pred)
+
+ggplot(rf_pred, aes(x = comb08, y = .pred)) +
+  geom_point(alpha = 0.3) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red") +
+  labs(
+    title = "Random Forest: Actual vs Predicted",
+    x = "Actual comb08",
+    y = "Predicted comb08"
+  ) +
+  theme_minimal()
+
+rf_pred <- rf_pred %>%
+  mutate(residual = comb08 - .pred)
+
+ggplot(rf_pred, aes(x = .pred, y = residual)) +
+  geom_point(alpha = 0.3) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  labs(
+    title = "Residual Plot",
+    x = "Predicted comb08",
+    y = "Residuals"
+  ) +
+  theme_minimal()
+```
+The best random forest model has a strong predictive performance on the test data. On the test set, the model reached RMSE = 2.56, MAE = 1.26 and R² = 0.964, meaning that over 96% of the variance in combined fuel economy was explained. 
+The graphs can confirm, that the model performs great on standard vehicles, however, it underestimates values for electrical vehicles with high MPG.
+
+### KNN
+Lastly, we will train also a KNN model. We will train a simple model with randomly selected parameters and then, we will find the best model using hyperparameters tuning.
+
+```{r}
+knn_model <- nearest_neighbor(
+  neighbors = 10,
+  weight_func = "rectangular",
+  dist_power  = 1
+) %>%
+  set_engine("kknn") %>%
+  set_mode("regression")
+
+knn_wf <- workflow() %>%
+  add_recipe(model_recipe) %>%
+  add_model(knn_model) %>%
+  fit(data = train_data)
+```
+
+```{r}
+knn_pred <- predict(knn_wf, new_data = test_data) %>%
+  bind_cols(test_data %>% select(comb08))
+
+# we will check predictions in the first rows
+head(knn_pred)
+
+metrics(knn_pred, truth = comb08, estimate = .pred)
+```
+The model achieved strong predictive performance on the test data, with RMSE = 3.27, MAE = 1.68 and R² = 0.943. This means that over 94% of the variability in `comb08` was explained by the predictors. 
+Predicted values were close to the observed values, the actual values were mostly predicted with only small deviations.
+
+```{r}
+ggplot(knn_pred, aes(x = comb08, y = .pred)) +
+  geom_point(alpha = 0.3) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red") +
+  labs(
+    title = "KNN: Actual vs Predicted",
+    x = "Actual comb08",
+    y = "Predicted comb08"
+  ) +
+  theme_minimal()
+
+knn_pred <- knn_pred %>%
+  mutate(residual = comb08 - .pred)
+
+ggplot(knn_pred, aes(x = .pred, y = residual)) +
+  geom_point(alpha = 0.3) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  labs(
+    title = "Residual Plot",
+    x = "Predicted comb08",
+    y = "Residuals"
+  ) +
+  theme_minimal()
+```
+The actual vs. predicted plot as well as the residuals plot is very similar to random forests plots. The model has strong predictive performance for standard vehicles, however it tends to underestimate electric vehicles with higher MPG.
+
+
+Hyperparameters tuning
+```{r}
+knn_spec <- nearest_neighbor(
+  neighbors = tune(),
+  weight_func = tune(),
+  dist_power  = tune()
+) %>%
+  set_engine("kknn") %>%
+  set_mode("regression")
+
+knn_wf <- workflow() %>%
+  add_recipe(model_recipe) %>%
+  add_model(knn_spec)
+
+# KNN hyperparameters tuning
+knn_grid <- grid_regular(
+  neighbors(range = c(3, 25)),
+  weight_func(values = c("rectangular", "triangular", "gaussian")),
+  dist_power(range = c(1, 2)),
+  levels = 3
+)
+
+cat("=== Tuning KNN ===\n")
+knn_tune <- tune_grid(
+  knn_wf,
+  resamples = folds,
+  grid      = knn_grid,
+  metrics   = metrics_set,
+  control   = tune_ctrl
+)
+
+knn_best <- select_best(knn_tune, metric = "rmse")
+cat("The best parameters for KNN:\n"); print(knn_best)
+
+
+knn_final <- knn_wf %>%
+  finalize_workflow(knn_best) %>%
+  fit(data = train_data)
+```
+The best KNN model is a model with parameters: 
+-   neighbors = 14
+-   weight_func = triangular
+-   dist_power = 1
+
+
+Evaluation of the best KNN model
+```{r}
+knn_pred <- predict(knn_final, new_data = test_data) %>%
+  bind_cols(test_data %>% select(comb08))
+
+# we will check predictions in the first rows
+head(knn_pred)
+
+metrics(knn_pred, truth = comb08, estimate = .pred)
+
+ggplot(knn_pred, aes(x = comb08, y = .pred)) +
+  geom_point(alpha = 0.3) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red") +
+  labs(
+    title = "KNN: Actual vs Predicted",
+    x = "Actual comb08",
+    y = "Predicted comb08"
+  ) +
+  theme_minimal()
+
+knn_pred <- knn_pred %>%
+  mutate(residual = comb08 - .pred)
+
+ggplot(knn_pred, aes(x = .pred, y = residual)) +
+  geom_point(alpha = 0.3) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  labs(
+    title = "Residual Plot",
+    x = "Predicted comb08",
+    y = "Residuals"
+  ) +
+  theme_minimal()
+```
+The KNN model achieved strong predictive performance, with RMSE = 3.00 and R² = 0.952 on the test set. Predicted values were close to the observed values, indicating that the model was able to capture the relationship between the predictors and the target variable effectively. The actual values were mostly predicted with only small deviations.
+The actual vs. predicted plot as well as the residuals plot is very similar to random forests plots. The model has strong predictive performance for standard vehicles, however it tends to underestimate electric vehicles with higher MPG.
+
+
+
+## PCA - Principal Component Analysis
+
+```{r message=FALSE, warning=FALSE}
+library(factoextra)
+```
+
+
+```{r}
+pca_input <- train_processed %>%
+  select(-comb08)   # remove target
+
+cat("Size of PCA input:", nrow(pca_input), "×", ncol(pca_input), "\n")
+```
+
+```{r}
+pca_result <- prcomp(pca_input, center = FALSE, scale. = FALSE)
+# center=FALSE a scale.=FALSE because train_processed is already normalised
+```
+
+```{r}
+explained_var <- summary(pca_result)$importance
+cat("\nFirst 10 components:\n")
+print(explained_var[, 1:10])
+```
+The PCA was performed on the preprocessed training data, which had already been normalized and dummy-encoded. The first principal component explains approximately 13.8% of the total variance, while the second accounts for 9.3%. The explained variance decreases gradually across subsequent components, with no single dominant component, what suggests that the information in the dataset is relatively evenly distributed across many features rather than concentrated in a few directions. 
+The first 10 components together capture about 70.7% of the total variance.
+
+```{r}
+cum_var <- as.data.frame(t(explained_var)) %>%
+  rownames_to_column("PC") %>%
+  setNames(c("PC", "std_dev", "prop_var", "cum_var")) %>%
+  mutate(PC_num = as.integer(str_extract(PC, "\\d+")))
+```
+
+```{r}
+for (threshold in c(0.80, 0.90, 0.95)) {
+  n <- min(which(cum_var$cum_var >= threshold))
+  cat(sprintf("Number of PC for %.0f%% of variance: %d\n", threshold * 100, n))
+}
+```
+To reach 80%, 90%, and 95% of cumulative variance, 13, 15, and 17 components are required respectively. The relatively high number of components needed to explain a substantial portion of variance is consistent with the high-dimensional nature of the dataset after dummy encoding, where many categorical variables were expanded into binary columns.
+
+```{r}
+p1 <- cum_var %>%
+  filter(PC_num <= 30) %>%
+  ggplot(aes(x = PC_num, y = prop_var)) +
+  geom_col(fill = "steelblue") +
+  geom_line(aes(group = 1), color = "darkblue", linewidth = 0.8) +
+  geom_point(color = "darkblue", size = 2) +
+  scale_x_continuous(breaks = 1:30) +
+  labs(
+    title = "Scree Plot - explained variance ratio",
+    x     = "Principal component",
+    y     = "Variance ratio"
+  ) +
+  theme_minimal()
+
+p2 <- cum_var %>%
+  filter(PC_num <= 30) %>%
+  ggplot(aes(x = PC_num, y = cum_var)) +
+  geom_line(color = "steelblue", linewidth = 1) +
+  geom_point(color = "steelblue", size = 2) +
+  geom_hline(yintercept = c(0.80, 0.90, 0.95),
+             linetype = "dashed",
+             color = c("orange", "red", "darkred")) +
+  annotate("text", x = 25, y = 0.81, label = "80%", color = "orange",    size = 3) +
+  annotate("text", x = 25, y = 0.91, label = "90%", color = "red",       size = 3) +
+  annotate("text", x = 25, y = 0.96, label = "95%", color = "darkred",   size = 3) +
+  scale_x_continuous(breaks = seq(0, 30, 5)) +
+  labs(
+    title = "Cummulative explained variability",
+    x     = "Number of principal components",
+    y     = "Cummulative variance ratio"
+  ) +
+  theme_minimal()
+
+p1 + p2
+```
+The scree plot shows that the first principal component explains the largest share of variance (~13.8%), followed by a steep drop to the second component (~9.3%). After the third component, the decline becomes more gradual and the curve flattens, forming a characteristic elbow shape. This indicates that no single component dominates, and the remaining variance is spread relatively evenly across the subsequent components.
+
+The cumulative variance plot confirms this pattern. The curve rises steadily without any sharp jumps, which is typical for datasets with many moderately correlated features after dummy encoding. The three reference thresholds show that 80% of variance is reached at 13 components, 90% at 15 components, and 95% at 17 components.
+
+```{r}
+n_components <- min(which(cum_var$cum_var >= 0.95))
+cat("\nWe will use", n_components, "components (95% of variance)\n")
+```
+For subsequent modeling, 17 principal components were retained, capturing 95% of the total variance. This threshold was chosen as a balance between dimensionality reduction and information retention - discarding the remaining 5% removes noise and redundancy while keeping the majority of the signal present in the original features.
+The reduction was small but still useful given the relatively small original feature space after preprocessing.
+
+Discussion on explainability: After PCA there are features PC1, PC2... which do not have a direct interpretation, so explainability decreases.
+
+
+Now, we create a recipe, whicg will be used for comparison of models.
+```{r}
+pca_recipe <- recipe(comb08 ~ ., data = train_data) %>%
+  step_unknown(all_nominal_predictors()) %>%
+  step_other(all_nominal_predictors(), threshold = 0.01) %>%
+  step_impute_median(all_numeric_predictors()) %>%
+  step_impute_mode(all_nominal_predictors()) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_zv(all_predictors()) %>%
+  step_nzv(all_predictors()) %>%
+  step_normalize(all_numeric_predictors()) %>%
+  step_pca(all_numeric_predictors(), num_comp = n_components)
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
