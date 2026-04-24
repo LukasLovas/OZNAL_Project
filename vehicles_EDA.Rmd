@@ -374,7 +374,7 @@ cols_missing <- c(
 
 #### Identifier Columns (`cols_ids`)
 
-These variables are identifiers or overly specific strings. Using them would encourage the model to memorize specific vehicles or model lines instead of learning generalizable patterns.
+These variables are identifiers or overly specific strings. Using them would encourage the model to memorize specific vehicles or models.
 
 ```{r}
 cols_ids <- c("id", "engId", "model")
@@ -403,7 +403,7 @@ cols_leakage <- c(
 
 #### Sparse or Invalid Columns
 
-As identified in the EDA, many numeric columns have median = 0 or contain encoded missing values (−1). These are typically relevant only for electric or hybrid vehicles. Including them in the general regression dataset would introduce large numbers of zeros, encoded missing values, or derived information. They could be useful for targeted analyses of EV or PHEV subsets, but are excluded from the baseline model.
+As identified in the EDA, many numeric columns have median = 0 or contain encoded missing values (−1). These are typically relevant only for electric or hybrid vehicles. Including them in the general regression dataset would introduce large numbers of zeros, encoded missing values, or derived information.
 
 ```{r}
 cols_sparse_or_invalid <- c(
@@ -424,10 +424,10 @@ cols_sparse_or_invalid <- c(
 
 #### Unused Columns
 
--   `eng_dscr` has \~37% missing values and is a free-text engine description — not suitable for standard regression without NLP.
--   `createdOn` and `modifiedOn` are administrative metadata with no predictive value.
--   `baseModel` has high cardinality and would support memorization of specific model lines rather than generalization.
--   `fuelType` and `fuelType1` are replaced by the new `fuel_group` variable and removed from `vehicles_model` via an explicit `select()`. The raw columns remain intact in the original `data` object.
+-   `eng_dscr` has \~37% missing values and is a free-text engine description.
+-   `createdOn` and `modifiedOn` are metadata with no predictive value.
+-   `baseModel` would support memorization of specific model lines rather than generalization.
+-   `fuelType` and `fuelType1` are replaced by the new `fuel_group` variable.
 
 ```{r}
 cols_unused <- c("createdOn", "modifiedOn", "eng_dscr", "baseModel")
@@ -530,11 +530,14 @@ table(data_fe$VClass)
 
 #### `trany` — Extract Structured Transmission Features
 
-Instead of keeping the raw high-cardinality `trany` string, we extract three interpretable features:
+Instead of keeping the raw high-cardinality `trany` string, we extract four interpretable features:
 
 -   `transmission_type`: "Automatic", "Manual", or "Other"
 -   `is_cvt`: TRUE if the transmission uses continuously variable gear ratios
--   `n_gears`: number of speeds extracted from text (NA for non-standard transmissions)
+- `n_gears`: number of speeds extracted from text; 0 means "not applicable" (CVT or non-standard transmission)
+- `has_discrete_gears`: TRUE if the number of gear steps was successfully extracted from `trany`
+
+`has_discrete_gears` and `n_gears` are designed to be read together: `has_discrete_gears = FALSE` means a CVT or other transmission without a discrete gear count — this is not randomly missing data, but a structural property of the transmission. Setting `n_gears = 0` via `replace_na` provides a numeric sentinel that is safe to use in models without median imputation.
 
 The raw `trany` column is then removed.
 
@@ -548,7 +551,9 @@ data_fe <- data_fe %>%
     ),
     is_cvt  = str_detect(trany, regex("variable gear ratios", ignore_case = TRUE)),
     is_cvt  = replace_na(is_cvt, FALSE),
-    n_gears = as.integer(str_match(trany, "(\\d+)-spd")[, 2])
+    n_gears = as.integer(str_match(trany, "(\\d+)-spd")[, 2]),
+    has_discrete_gears = as.integer(!is.na(n_gears)),
+    n_gears = replace_na(n_gears, 0)
   )
 
 cat("Transmission type distribution:\n")
@@ -556,17 +561,23 @@ print(table(data_fe$transmission_type))
 cat("\nCVT vehicles:", sum(data_fe$is_cvt), "\n")
 cat("\nn_gears summary:\n")
 print(summary(data_fe$n_gears))
+cat("\nhas_discrete_gears distribution:\n")
+print(table(data_fe$has_discrete_gears))
 ```
 
 ### Build Final Modeling Dataset
 
-We apply all column removals. The raw `trany` is dropped because it is fully replaced by `transmission_type`, `is_cvt`, and `n_gears`. The raw `fuelType` and `fuelType1` are dropped because their information is captured by `fuel_group` and `is_electric` / `has_combustion_engine`. All three are removed via `any_of()` so the code stays safe if any column is already absent. The target `comb08` is always retained.
+We apply all column removals. The raw `trany` is dropped because it is fully replaced by `transmission_type`, `is_cvt`, and `n_gears`. The raw `fuelType` and `fuelType1` are dropped because their information is captured by `fuel_group`.
 
+Pure battery electric vehicles (BEVs) are excluded from the modeling dataset before the train/test split. The target variable `comb08` represents Miles Per Gallon (MPG) for combustion-engine vehicles, but for BEVs the EPA reports MPGe — an artificial conversion (33.7 kWh = 1 gallon equivalent) that does not reflect actual fuel consumption. Including BEVs would mix two structurally different quantities in a single regression target. Moreover, the features that drive MPGe — battery capacity, motor efficiency, regenerative braking — are not present in the dataset after removing high-missingness columns such as `evMotor`. The `is_electric` and `has_combustion_engine` flags are also dropped after filtering, as they become zero-variance constants.
 ```{r}
+n_ev <- sum(data_fe$is_electric)
 vehicles_model <- data_fe %>%
+  filter(!is_electric) %>%
   select(-any_of(cols_to_remove)) %>%
-  select(-any_of(c("trany", "fuelType", "fuelType1")))
-
+  select(-any_of(c("trany", "fuelType", "fuelType1", "is_electric", "has_combustion_engine")))
+cat("Electric vehicles excluded:", n_ev, "\n")
+cat("Remaining vehicles:        ", nrow(vehicles_model), "\n")
 cat("Dimensions of vehicles_model:", nrow(vehicles_model), "×", ncol(vehicles_model), "\n")
 cat("\nColumns retained:\n")
 print(names(vehicles_model))
@@ -594,11 +605,10 @@ print(missing_before[missing_before > 0])
 cat("Total missing values:", sum(is.na(vehicles_model)), "\n")
 ```
 
-High `comb08` values (up to 146 MPG) are not removed. These outliers represent technologically distinct vehicles — primarily electric or highly efficient models — and are valid observations.
-
+After excluding BEVs, the remaining `comb08` values reflect actual MPG from combustion-engine and hybrid vehicles. Extreme values at the high end (diesel hybrids, efficient compact cars) are retained as valid observations.
 ### Train/Test Split
 
-We use stratified splitting on `comb08` to ensure both sets reflect similar proportions of common and highly efficient vehicles. Because `comb08` is numeric, `rsample` bins it internally before stratifying.
+We split the data into 80% training and 20% test. The test set is only used at the very end to evaluate final model performance — we do not touch it during training or tuning. We stratify on `comb08` so both sets have a similar distribution of MPG values.
 
 ```{r}
 set.seed(123)
@@ -650,12 +660,11 @@ print(folds)
 
 ### Preprocessing Recipe
 
-The recipe is defined on `train_data` and fitted only on the training set to prevent leakage of test statistics into training:
+We define preprocessing as a `recipe` to prevent data leakage — all transformations (normalization, imputation, dummy encoding) are learned only from the training data and then applied to the test set using those saved values. This also works correctly inside cross-validation, where each fold fits its own preprocessing independently.
 
 -   `step_unknown()` — handles unseen factor levels that may appear in the test set
 -   `step_other()` — collapses any residual rare categories below 1%
--   `step_impute_median()` — fills remaining numeric NAs with training-set medians (e.g., non-EV rows with missing `displ`)
--   `step_impute_mode()` — fills remaining nominal NAs with training-set modes
+-   `step_impute_median(displ, cylinders)` — fills the small number of numeric NAs in engine parameters for non-BEV rows; `n_gears` is intentionally set to 0 in feature engineering and does not need imputation
 -   `step_dummy()` — one-hot encodes all nominal predictors; required by linear regression methods
 -   `step_zv()` / `step_nzv()` — removes zero- and near-zero-variance columns, consistent with EDA findings on low-variability variables
 -   `step_normalize()` — standardizes all numeric predictors; required for ridge, lasso, elastic net, kNN, and PCA/PCR/PLS
@@ -664,8 +673,7 @@ The recipe is defined on `train_data` and fitted only on the training set to pre
 model_recipe <- recipe(comb08 ~ ., data = train_data) %>%
   step_unknown(all_nominal_predictors()) %>%
   step_other(all_nominal_predictors(), threshold = 0.01) %>%
-  step_impute_median(all_numeric_predictors()) %>%
-  step_impute_mode(all_nominal_predictors()) %>%
+  step_impute_median(displ, cylinders) %>%
   step_dummy(all_nominal_predictors()) %>%
   step_zv(all_predictors()) %>%
   step_nzv(all_predictors()) %>%
