@@ -790,9 +790,9 @@ dt_final <- dt_wf %>%
   fit(data = train_data)
 ```
 The best decision tree model has these parameters:
--   cost_complexity = 1e-04
+-   cost_complexity = 0.0001
 -   tree_depth = 15
--   min_n = 14
+-   min_n = 8
 
 ```{r}
 # get metrics on train data
@@ -818,8 +818,10 @@ bind_rows(dt_train_metrics, dt_test_metrics) %>%
 # check predictions in the first rows
 head(dt_preds)
 ```
-The tuned Decision Tree achieved solid predictive performance with RMSE = 3.20, MAE = 1.94 and R² = 0.944. Predicted values were close to the observed values. The predicted values are repeating, which is typical for tree-based regression.
+The tuned decision tree achieved solid predictive performance and showed good generalization to unseen data. Predicted `comb08` values were close to the actual observed values, with only small deviations in the predictions.
 
+On the training data, the model reached an RMSE of 2.01 and an MAE of 1.38, indicating low average prediction errors. On the test dataset, performance remained similar, with an RMSE of 2.15 and an MAE of 1.44. The small increase in error from training to test data suggests that the model generalizes well and does not suffer from overfitting.
+Based on the R² values, we can say that the model explained 87.9% of the variance in the training data and 86.1% of the variance in the test data.
 
 ```{r}
 ggplot(dt_preds, aes(x = comb08, y = .pred)) +
@@ -845,9 +847,10 @@ ggplot(dt_pred, aes(x = .pred, y = residual)) +
   ) +
   theme_minimal()
 ```
-Based on the actual vs. predicted graph, we can say that the model performs great on standard vehicles, however, it underestimates special vehicles with high MPG.
+The Actual vs Predicted plot shows a clear positive linear relationship between observed and predicted comb08 values, indicating that the model captures the main structure of the data well. Most points are concentrated in range 15-35 MPG, these are predicted with good accuracy. For higher values of `comb08` , the model indicates lower accuracy as it tends to underpredict some most efficient vehicles.
+A typical step pattern is visible in the predictions, which is expected for decision trees because they assign the same predicted value to all observations within a terminal node.
 
-From the residuals graph, we can tell that residuals are centered around zero for most observations, but residual variance increases for high predicted MPG values. The model does not predict values for electric and hybrid vehicles well. The graph indicates heteroskedasticity in the upper tail of the target distribution.
+From the Residual plot, we can tell that residuals are centered around zero for most observations, but residual variance increases for high predicted MPG values. The graph indicates mild heteroskedasticity.
 
 ```{r}
 dt_final %>%
@@ -862,7 +865,7 @@ The graph shows 15 most important features, which were used by model to predict 
 
 Secondly, we will create random forest model. The random forest algorithm doesnt need normalised data, however we will use the prepared recipe with a normalisation step.
 
-Since our dataset is quite large (40 000 rows) and the `randomForest` engine is training quite slow, we will use a `ranger` engine in hyperparameters tuning steps, because it trains much quicker.
+Since our dataset is quite large (40 000 rows) and the `randomForest` engine is training quite slowly, we will use a `ranger` engine in hyperparameters tuning steps, because it trains much quicker.
 
 Hyperparameters tuning
 ```{r}
@@ -929,7 +932,11 @@ bind_rows(rf_train_metrics, rf_test_metrics) %>%
 # check predictions in the first rows
 head(rf_pred)
 ```
-The best random forest model has a strong predictive performance on the test data. On the test set, the model reached RMSE = 2.56, MAE = 1.26 and R² = 0.964, meaning that over 96% of the variance in combined fuel economy was explained. 
+The best random forest model achieved excellent predictive performance and outperformed the simpler decision tree model in terms of prediction error and explained variance. Predicted `comb08` values were predicted almost exactly.
+
+On the training data, the model achieved an RMSE of 1.39 and an MAE of 0.76, indicating very low prediction errors. On the test dataset, performance remained strong, with an RMSE of 1.75 and an MAE of 1.03. Although the error increased slightly on unseen data, the difference between training and test results is relatively small, suggesting good generalization ability.
+
+The model explained 94.2% of the variance in the training data and 90.9% of the variance in the test data, based on the R² values, so the underlying relationships between predictors and fuel economy were captured extremely well.
 
 ```{r}
 ggplot(rf_pred, aes(x = comb08, y = .pred)) +
@@ -955,10 +962,27 @@ ggplot(rf_pred, aes(x = .pred, y = residual)) +
   ) +
   theme_minimal()
 ```
-The graphs can confirm, that the model performs great on standard vehicles, however, it underestimates values for electrical vehicles with high MPG.
+The Actual vs Predicted plot shows strong agreement between observed and predicted `comb08` values, with most points close to the diagonal line. This indicates accurate predictions across a wide range of vehicles, especially in the common 15–35 MPG range.
+Prediction errors increase slightly for vehicles with very high fuel efficiency, but the model still remains relatively accurate in this region. There is a small tendency to underpredict the highest MPG values, although less than in the decision tree model.
+
+From the Residual plot, we can tell that residuals are centered around zero for most observations, but residual variance increases for high predicted MPG values. The graph indicates mild heteroskedasticity.
+
+Overall, the random forest model provides better predictive performance and stronger generalization than the decision tree, though it is less interpretable.
 
 ### KNN
 Lastly, we will train also a KNN model. We will find the best model using hyperparameters tuning.
+
+```{r}
+knn_recipe <- recipe(comb08 ~ ., data = train_data) %>%
+  step_novel(all_nominal_predictors()) %>%
+  step_unknown(all_nominal_predictors()) %>%
+  step_other(all_nominal_predictors(), threshold = 0.01) %>%
+  step_impute_median(displ, cylinders) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_zv(all_predictors()) %>%
+  step_normalize(all_numeric_predictors())
+```
+
 
 Hyperparameters tuning
 ```{r}
@@ -971,7 +995,7 @@ knn_spec <- nearest_neighbor(
   set_mode("regression")
 
 knn_wf <- workflow() %>%
-  add_recipe(model_recipe) %>%
+  add_recipe(knn_recipe) %>%
   add_model(knn_spec)
 
 # KNN hyperparameters tuning
@@ -1000,8 +1024,8 @@ knn_final <- knn_wf %>%
   fit(data = train_data)
 ```
 The best KNN model is a model with parameters: 
--   neighbors = 14
--   weight_func = triangular
+-   neighbors = 3
+-   weight_func = gaussian
 -   dist_power = 1
 
 ```{r}
@@ -1029,7 +1053,11 @@ bind_rows(knn_train_metrics, knn_test_metrics) %>%
 head(knn_pred)
 ```
 
-The KNN model achieved strong predictive performance, with RMSE = 3.00 and R² = 0.952 on the test set. Predicted values were close to the observed values, indicating that the model was able to capture the relationship between the predictors and the target variable effectively. The actual values were mostly predicted with only small deviations.
+The KNN model achieved strong predictive performance on both training and test data. Predicted `comb08` values were again very close to the actual observed values.
+
+On the training data, the model reached an RMSE of 1.12 and an MAE of 0.60, indicating very low prediction errors. On the test dataset, performance remained strong, with an RMSE of 1.69 and an MAE of 0.98. The moderate increase in error from training to test data suggests good generalization with mild overfitting.
+
+The model explained 96.2% of the variance in the training data and 91.4% of the variance in the test data, based on the R² values. This indicates that the KNN model captured the relationships between predictors and fuel economy extremely well.
 
 ```{r}
 ggplot(knn_pred, aes(x = comb08, y = .pred)) +
@@ -1055,7 +1083,7 @@ ggplot(knn_pred, aes(x = .pred, y = residual)) +
   ) +
   theme_minimal()
 ```
-The actual vs. predicted plot as well as the residuals plot is very similar to random forests plots. The model has strong predictive performance for standard vehicles, however it tends to underestimate electric vehicles with higher MPG.
+The actual vs. predicted plot as well as the residuals plot is very similar to random forests plots. The model has strong predictive performance for standard vehicles, however it tends to underestimate more efficient vehicles with higher MPG.
 
 
 
@@ -1096,8 +1124,8 @@ explained_var <- summary(pca_result)$importance
 cat("\nFirst 10 components:\n")
 print(explained_var[, 1:10])
 ```
-The PCA was performed on the preprocessed training data, which had already been normalized and dummy-encoded. The first principal component explains approximately 13.8% of the total variance, while the second accounts for 9.3%. The explained variance decreases gradually across subsequent components, with no single dominant component, what suggests that the information in the dataset is relatively evenly distributed across many features rather than concentrated in a few directions. 
-The first 10 components together capture about 70.7% of the total variance.
+The PCA was performed on the preprocessed training data, which had already been normalized and dummy-encoded. The first principal component explains approximately 13.6% of the total variance, while the second accounts for 11,97%. The explained variance decreases gradually across subsequent components, with no single dominant component, what suggests that the information in the dataset is moderately distributed across multiple dimensions rather than being concentrated in a few directions. 
+The first 10 components together capture about 68.9% of the total variance.
 
 ```{r}
 cum_var <- as.data.frame(t(explained_var)) %>%
@@ -1112,7 +1140,7 @@ for (threshold in c(0.80, 0.90, 0.95)) {
   cat(sprintf("Number of PC for %.0f%% of variance: %d\n", threshold * 100, n))
 }
 ```
-To reach 80%, 90%, and 95% of cumulative variance, 13, 15, and 17 components are required respectively. The relatively high number of components needed to explain a substantial portion of variance is consistent with the high-dimensional nature of the dataset after dummy encoding, where many categorical variables were expanded into binary columns.
+To reach 80%, 90%, and 95% of cumulative variance, 13, 16, and 18 components are required respectively. The relatively high number of components needed to explain a substantial portion of variance is consistent with the high-dimensional nature of the dataset after dummy encoding, where many categorical variables were expanded into binary columns.
 
 ```{r}
 p1 <- cum_var %>%
@@ -1137,10 +1165,10 @@ p2 <- cum_var %>%
   geom_hline(yintercept = c(0.80, 0.90, 0.95),
              linetype = "dashed",
              color = c("orange", "red", "darkred")) +
-  annotate("text", x = 25, y = 0.81, label = "80%", color = "orange",    size = 3) +
-  annotate("text", x = 25, y = 0.91, label = "90%", color = "red",       size = 3) +
-  annotate("text", x = 25, y = 0.96, label = "95%", color = "darkred",   size = 3) +
-  scale_x_continuous(breaks = seq(0, 30, 5)) +
+  annotate("text", x = 22, y = 0.81, label = "80%", color = "orange",    size = 3) +
+  annotate("text", x = 22, y = 0.91, label = "90%", color = "red",       size = 3) +
+  annotate("text", x = 22, y = 0.96, label = "95%", color = "darkred",   size = 3) +
+  scale_x_continuous(breaks = seq(0, 23, 5)) +
   labs(
     title = "Cummulative explained variability",
     x     = "Number of principal components",
@@ -1150,21 +1178,21 @@ p2 <- cum_var %>%
 
 p1 + p2
 ```
-The scree plot shows that the first principal component explains the largest share of variance (~13.8%), followed by a steep drop to the second component (~9.3%). After the third component, the decline becomes more gradual and the curve flattens, forming a characteristic elbow shape. This indicates that no single component dominates, and the remaining variance is spread relatively evenly across the subsequent components.
+The scree plot shows that the first principal component explains the largest share of variance (~14%), followed by a notable drop to the second component (~12%). After the third component, the decline becomes more gradual and the curve flattens, forming a characteristic elbow shape. This indicates that no single component strongly dominates, and the remaining variance is spread relatively evenly across the subsequent components.
 
-The cumulative variance plot confirms this pattern. The curve rises steadily without any sharp jumps, which is typical for datasets with many moderately correlated features after dummy encoding. The three reference thresholds show that 80% of variance is reached at 13 components, 90% at 15 components, and 95% at 17 components.
+The cumulative variance plot confirms this pattern. The curve rises steadily without any sharp jumps, which is typical for datasets with many moderately correlated features after dummy encoding. The three reference thresholds show that 80% of variance is reached at 13 components, 90% at 16 components, and 95% at 18 components.
 
 ```{r}
 n_components <- min(which(cum_var$cum_var >= 0.95))
 cat("\nWe will use", n_components, "components (95% of variance)\n")
 ```
-For subsequent modeling, 17 principal components were retained, capturing 95% of the total variance. This threshold was chosen as a balance between dimensionality reduction and information retention - discarding the remaining 5% removes noise and redundancy while keeping the majority of the signal present in the original features.
+For subsequent modeling, 18 principal components were retained, capturing 95% of the total variance. This threshold was chosen as a balance between dimensionality reduction and information retention - discarding the remaining 5% removes noise and redundancy while keeping the majority of the signal present in the original features.
 The reduction was small but still useful given the relatively small original feature space after preprocessing.
 
 Discussion on explainability: After PCA there are features PC1, PC2... which do not have a direct interpretation, so explainability decreases.
 
 
-Now, we create a recipe, whicg will be used for comparison of models.
+Now, we create a recipe, which will be used for comparison of models.
 ```{r}
 pca_recipe <- recipe(comb08 ~ ., data = train_data) %>%
   step_unknown(all_nominal_predictors()) %>%
@@ -1178,7 +1206,8 @@ pca_recipe <- recipe(comb08 ~ ., data = train_data) %>%
   step_pca(all_numeric_predictors(), num_comp = n_components)
 ```
 
-Now we train a random forest model using preprocessed data with pca_recipe. We chose the random forest model, since it had the best preformance in the previous task.
+Now we train a random forest model using preprocessed data with pca_recipe. 
+Although the KNN model achieved slightly better predictive performance in the previous task, the random forest model is more robust and less sensitive to overfitting.
 ```{r}
 pca_rf_model <- rand_forest(
   trees = 200,
@@ -1217,7 +1246,7 @@ pca_rf_final <- pca_rf_workflow %>%
 The best random forest model with PCA has these parameters:
 -   trees = 200
 -   mtry = 10
--   min_n = 2
+-   min_n = 11
 
 ```{r}
 # get metrics on train data
@@ -1243,7 +1272,13 @@ bind_rows(pca_rf_train_metrics, pca_rf_test_metrics) %>%
 # check predictions in the first rows
 head(pca_rf_pred)
 ```
-The best random forest model with PCA has a strong predictive performance on the test data. On the test set, the model reached RMSE = 2.56, MAE = 1.26 and R² = 0.964, meaning that over 96% of the variance in combined fuel economy was explained. 
+The best random forest model with PCA shows good overall performance, but it is slightly less accurate than models trained on the original features.
+
+On the training set, the model achieved an RMSE of 1.36, MAE of 0.76, and R² of 0.944, indicating a very strong fit and that it explains about 94% of the variance in `comb08`. However, performance decreases on the test set, where the model reaches an RMSE of 1.97, MAE of 1.16, and R² of 0.885. This gap suggests mild overfitting, although part of the decrease in test performance may also be attributed to information loss introduced by PCA dimensionality reduction.
+
+The sample predictions show that the model still captures general trends in fuel consumption well, but with slightly larger errors compared to models without PCA.
+
+Overall, the model remains reliable and captures the main structure of the data, but the PCA transformation likely removed some fine-grained information that was useful for prediction. As a result, predictive performance is slightly reduced compared to models trained on the original feature space.
 
 ```{r}
 ggplot(pca_rf_pred, aes(x = comb08, y = .pred)) +
@@ -1269,7 +1304,11 @@ ggplot(pca_rf_pred, aes(x = .pred, y = residual)) +
   ) +
   theme_minimal()
 ```
-xx
+The Actual vs. Predicted plot shows that the model tracks the diagonal reasonably well in the lower range (10–30 MPG), where most observations are concentrated. However, as actual values increase beyond 40, predictions increasingly underestimate the true values.
+
+The Residual plot reveals a clear funnel shape: residuals are tightly clustered near zero for low predicted values but spread substantially as predictions increase. This heteroscedasticity suggests the model struggles with higher fuel efficiency vehicles, likely because they are underrepresented in the training data after PCA transformation. The residuals are roughly centered around zero overall, indicating no systematic bias in the mid-range, but the upper tail remains problematic.
+
+Overall, the model performs adequately for typical vehicles but loses precision for fuel-efficient outliers.
 
 ```{r}
 
