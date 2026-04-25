@@ -22,6 +22,8 @@ Based on the column descriptions, we could potentially predict fuel consumption 
 -   **Target variable:** `comb08`
 
 ```{r message=FALSE, warning=FALSE}
+library(MASS)        # stepAIC
+library(leaps)
 library(tidyverse)
 library(ggcorrplot)
 library(patchwork)
@@ -1309,6 +1311,174 @@ The Actual vs. Predicted plot shows that the model tracks the diagonal reasonabl
 The Residual plot reveals a clear funnel shape: residuals are tightly clustered near zero for low predicted values but spread substantially as predictions increase. This heteroscedasticity suggests the model struggles with higher fuel efficiency vehicles, likely because they are underrepresented in the training data after PCA transformation. The residuals are roughly centered around zero overall, indicating no systematic bias in the mid-range, but the upper tail remains problematic.
 
 Overall, the model performs adequately for typical vehicles but loses precision for fuel-efficient outliers.
+
+## Feature selection
+
+```{r}
+null_model <- lm(comb08 ~ 1, data = train_processed)
+full_model <- lm(comb08 ~ ., data = train_processed)
+
+cat("\nNull model AIC:", AIC(null_model), "\n")
+cat("Full model AIC:", AIC(full_model), "\n")
+```
+
+```{r}
+cat("\n=== Forward stepwise selection ===\n")
+forward_model <- MASS::stepAIC(
+  null_model,
+  scope     = list(lower = null_model, upper = full_model),
+  direction = "forward",
+  trace     = 1
+)
+```
+
+```{r}
+cat("\n=== Result of forward selection ===\n")
+forward_summary <- summary(forward_model)
+print(forward_summary)
+```
+
+
+```{r}
+selected_vars_forward <- names(coef(forward_model))[-1]  # without intercept
+cat("\nNumber of selected variables:", length(selected_vars_forward), "\n")
+cat("Selected variables:\n")
+print(selected_vars_forward)
+```
+
+```{r}
+coef_table <- as.data.frame(forward_summary$coefficients) %>%
+  rownames_to_column("variable") %>%
+  setNames(c("variable", "estimate", "std_error", "t_value", "p_value")) %>%
+  filter(variable != "(Intercept)") %>%
+  arrange(p_value)
+
+cat("\n=== Coeficients a p-values ===\n")
+print(as.data.frame(coef_table), row.names = FALSE)
+```
+
+```{r}
+insignificant <- coef_table %>%
+  filter(p_value > 0.05)
+
+cat("\nNumber of insignificant variables (p > 0.05):",
+    nrow(insignificant), "\n")
+print(insignificant)
+```
+
+```{r}
+forward_preds <- predict(forward_model, newdata = test_processed)
+
+forward_metrics <- tibble(
+  truth    = test_processed$comb08,
+  estimate = forward_preds
+) %>%
+  metrics(truth = truth, estimate = estimate) %>%
+  mutate(model = "Forward Stepwise")
+
+cat("\n=== Evaluation on test set ===\n")
+print(forward_metrics)
+```
+
+```{r}
+forward_train_preds <- predict(forward_model, newdata = train_processed)
+
+forward_train_metrics <- tibble(
+  truth    = train_processed$comb08,
+  estimate = forward_train_preds
+) %>%
+  metrics(truth = truth, estimate = estimate) %>%
+  mutate(split = "train")
+
+forward_test_metrics <- tibble(
+  truth    = test_processed$comb08,
+  estimate = forward_preds
+) %>%
+  metrics(truth = truth, estimate = estimate) %>%
+  mutate(split = "test")
+
+bind_rows(forward_train_metrics, forward_test_metrics) %>%
+  dplyr::select(split, .metric, .estimate) %>%
+  pivot_wider(names_from = split, values_from = .estimate)
+```
+
+```{r}
+# --- 7a. Koeficienty vybraných premenných ---
+coef_table %>%
+  slice_head(n = 20) %>%
+  mutate(
+    variable  = reorder(variable, abs(estimate)),
+    significant = p_value < 0.05
+  ) %>%
+  ggplot(aes(x = variable, y = estimate, fill = significant)) +
+  geom_col() +
+  scale_fill_manual(
+    values = c("TRUE" = "steelblue", "FALSE" = "tomato"),
+    labels = c("TRUE" = "p < 0.05", "FALSE" = "p ≥ 0.05")
+  ) +
+  coord_flip() +
+  labs(
+    title = "Forward Selection — koeficienty top 20 premenných",
+    x     = NULL,
+    y     = "Koeficient",
+    fill  = "Významnosť"
+  ) +
+  theme_minimal()
+
+# --- 7b. Skutočné vs predikované ---
+tibble(actual = test_processed$comb08, predicted = forward_preds) %>%
+  ggplot(aes(x = actual, y = predicted)) +
+  geom_point(alpha = 0.2, size = 0.8, color = "steelblue") +
+  geom_abline(slope = 1, intercept = 0,
+              linetype = "dashed", color = "red") +
+  labs(
+    title = "Forward Selection — skutočné vs. predikované",
+    x     = "Skutočné comb08",
+    y     = "Predikované comb08"
+  ) +
+  theme_minimal()
+
+# --- 7c. Reziduály ---
+tibble(predicted = forward_preds,
+       residual  = test_processed$comb08 - forward_preds) %>%
+  ggplot(aes(x = predicted, y = residual)) +
+  geom_point(alpha = 0.2, size = 0.8, color = "steelblue") +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  labs(
+    title = "Forward Selection — reziduály",
+    x     = "Predikované comb08",
+    y     = "Rezidual"
+  ) +
+  theme_minimal()
+
+# --- 7d. AIC priebeh (koľko premenných bolo pridaných) ---
+# stepAIC ukladá históriu do $anova
+aic_progress <- as.data.frame(forward_model$anova) %>%
+  rownames_to_column("step") %>%
+  mutate(step_num = row_number())
+
+ggplot(aic_progress, aes(x = step_num, y = AIC)) +
+  geom_line(color = "steelblue", linewidth = 1) +
+  geom_point(color = "steelblue", size = 2) +
+  labs(
+    title = "Forward Selection — pokles AIC počas selekcie",
+    x     = "Krok (počet pridaných premenných)",
+    y     = "AIC"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
 
 ```{r}
 
