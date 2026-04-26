@@ -1313,6 +1313,12 @@ The Residual plot reveals a clear funnel shape: residuals are tightly clustered 
 Overall, the model performs adequately for typical vehicles but loses precision for fuel-efficient outliers.
 
 ## Feature selection
+xx
+
+### Forward stepwise selection
+
+Forward stepwise selection is an algorithmic feature selection method that builds a regression model incrementally. Starting from a null model with no predictors, it evaluates all candidate variables at each step and adds the one that most improves model fit, measured by AIC (Akaike Information Criterion). The process continues until no remaining variable reduces the AIC further.
+Among the three algorithmic approaches (forward, backward and mixed selection) forward selection was chosen because it is a starting point when there is no strong prior knowledge about which predictors are relevant. Backward selection requires fitting a full model first, which can be unstable when some predictors are correlated, as seen in our EDA where `displ` and `cylinders` showed high multicollinearity. Mixed selection combines both directions but adds unnecessary complexity.
 
 ```{r}
 null_model <- lm(comb08 ~ 1, data = train_processed)
@@ -1321,6 +1327,7 @@ full_model <- lm(comb08 ~ ., data = train_processed)
 cat("\nNull model AIC:", AIC(null_model), "\n")
 cat("Full model AIC:", AIC(full_model), "\n")
 ```
+The null model, containing only an intercept and no predictors, achieved an AIC of 245612.9. The full model using all available predictors had AIC of 202102.7, which is a substantial improvement indicating that the predictors collectively carry meaningful information about fuel efficiency.
 
 ```{r}
 cat("\n=== Forward stepwise selection ===\n")
@@ -1331,54 +1338,28 @@ forward_model <- MASS::stepAIC(
   trace     = 1
 )
 ```
+The forward selection algorithm started from the null model and added predictors one at a time, retaining each variable only if it reduced the AIC. The first variable added was `displ`, which produced the largest single AIC drop from 135 685 to 109 690, confirming it as the strongest individual predictor of fuel efficiency. Subsequent steps added `year`, `drive_Front.Wheel.Drive`, `fuel_group_Gasoline`, and further variables with progressively reduced AIC. The algorithm terminated after 21 steps when no remaining variable could further reduce the AIC.
 
 ```{r}
 cat("\n=== Result of forward selection ===\n")
 forward_summary <- summary(forward_model)
 print(forward_summary)
 ```
-
+The final model retained 21 out of the available predictors. The model explains 67.5% of variance in `comb08` (R² = 0.675), with all 21 selected variables being statistically significant at the 0.001 level. The strongest negative predictors are `displ` with estimate −2.25 and `has_discrete_gears` with estimate −1.72, while the largest positive predictors are `drive_Front.Wheel.Drive` with estimate 1.46 and `year` with estimate 0.95. 
 
 ```{r}
 selected_vars_forward <- names(coef(forward_model))[-1]  # without intercept
 cat("\nNumber of selected variables:", length(selected_vars_forward), "\n")
 cat("Selected variables:\n")
 print(selected_vars_forward)
+
+all_vars_forward <- names(train_processed %>% 
+                        dplyr::select(-comb08))
+removed_vars_forward <- setdiff(all_vars_forward, selected_vars_forward)
+cat("\nRemoved variables:\n")
+print(removed_vars_forward)
 ```
-
-```{r}
-coef_table <- as.data.frame(forward_summary$coefficients) %>%
-  rownames_to_column("variable") %>%
-  setNames(c("variable", "estimate", "std_error", "t_value", "p_value")) %>%
-  filter(variable != "(Intercept)") %>%
-  arrange(p_value)
-
-cat("\n=== Coeficients a p-values ===\n")
-print(as.data.frame(coef_table), row.names = FALSE)
-```
-
-```{r}
-insignificant <- coef_table %>%
-  filter(p_value > 0.05)
-
-cat("\nNumber of insignificant variables (p > 0.05):",
-    nrow(insignificant), "\n")
-print(insignificant)
-```
-
-```{r}
-forward_preds <- predict(forward_model, newdata = test_processed)
-
-forward_metrics <- tibble(
-  truth    = test_processed$comb08,
-  estimate = forward_preds
-) %>%
-  metrics(truth = truth, estimate = estimate) %>%
-  mutate(model = "Forward Stepwise")
-
-cat("\n=== Evaluation on test set ===\n")
-print(forward_metrics)
-```
+The model retained 21 predictors and removed the `VClass_Two.Seaters` variable.
 
 ```{r}
 forward_train_preds <- predict(forward_model, newdata = train_processed)
@@ -1389,6 +1370,8 @@ forward_train_metrics <- tibble(
 ) %>%
   metrics(truth = truth, estimate = estimate) %>%
   mutate(split = "train")
+
+forward_preds <- predict(forward_model, newdata = test_processed)
 
 forward_test_metrics <- tibble(
   truth    = test_processed$comb08,
@@ -1402,57 +1385,34 @@ bind_rows(forward_train_metrics, forward_test_metrics) %>%
   pivot_wider(names_from = split, values_from = .estimate)
 ```
 
+On the test set the model achieved RMSE = 3.28, MAE = 2.16, and R² = 0.678. Comparing train and test metrics shows practically no difference, indicating that the model generalizes well with no signs of overfitting. 
+However, compared to the random forest model (RMSE = 2.56, R² = 0.964), the linear forward selection model is considerably weaker, suggesting that the relationship between predictors and fuel efficiency contains substantial non-linear structure that a linear model cannot capture.
+
 ```{r}
-# --- 7a. Koeficienty vybraných premenných ---
-coef_table %>%
-  slice_head(n = 20) %>%
-  mutate(
-    variable  = reorder(variable, abs(estimate)),
-    significant = p_value < 0.05
-  ) %>%
-  ggplot(aes(x = variable, y = estimate, fill = significant)) +
-  geom_col() +
-  scale_fill_manual(
-    values = c("TRUE" = "steelblue", "FALSE" = "tomato"),
-    labels = c("TRUE" = "p < 0.05", "FALSE" = "p ≥ 0.05")
-  ) +
-  coord_flip() +
-  labs(
-    title = "Forward Selection — koeficienty top 20 premenných",
-    x     = NULL,
-    y     = "Koeficient",
-    fill  = "Významnosť"
-  ) +
-  theme_minimal()
-
-# --- 7b. Skutočné vs predikované ---
-tibble(actual = test_processed$comb08, predicted = forward_preds) %>%
+tibble(actual = test_processed$comb08,
+       predicted = forward_preds) %>%
   ggplot(aes(x = actual, y = predicted)) +
-  geom_point(alpha = 0.2, size = 0.8, color = "steelblue") +
-  geom_abline(slope = 1, intercept = 0,
-              linetype = "dashed", color = "red") +
+  geom_point(alpha = 0.3) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red") +
   labs(
-    title = "Forward Selection — skutočné vs. predikované",
-    x     = "Skutočné comb08",
-    y     = "Predikované comb08"
+    title = "Forward selection: Actual vs. Predicted",
+    x     = "Actual comb08",
+    y     = "Predicted comb08"
   ) +
   theme_minimal()
 
-# --- 7c. Reziduály ---
 tibble(predicted = forward_preds,
        residual  = test_processed$comb08 - forward_preds) %>%
   ggplot(aes(x = predicted, y = residual)) +
-  geom_point(alpha = 0.2, size = 0.8, color = "steelblue") +
+  geom_point(alpha = 0.3) +
   geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
   labs(
-    title = "Forward Selection — reziduály",
-    x     = "Predikované comb08",
-    y     = "Rezidual"
+    title = "Residual Plot",
+    x     = "Predicted comb08",
+    y     = "Residuals"
   ) +
   theme_minimal()
 
-# --- 7d. AIC priebeh (koľko premenných bolo pridaných) ---
-# stepAIC ukladá históriu do $anova
 aic_progress <- as.data.frame(forward_model$anova) %>%
   rownames_to_column("step") %>%
   mutate(step_num = row_number())
@@ -1461,19 +1421,30 @@ ggplot(aic_progress, aes(x = step_num, y = AIC)) +
   geom_line(color = "steelblue", linewidth = 1) +
   geom_point(color = "steelblue", size = 2) +
   labs(
-    title = "Forward Selection — pokles AIC počas selekcie",
-    x     = "Krok (počet pridaných premenných)",
+    title = "Forward selection - AIC decrease during selection",
+    x     = "Number of added variables",
     y     = "AIC"
   ) +
   theme_minimal()
 ```
+The Actual vs Predicted plot shows that the forward selection model captures the general positive relationship between actual and predicted `comb08`, especially for common values around 10–30 MPG. However, the model underpredicts highly fuel-efficient vehicles. This suggests the linear model cannot fully capture more complex relationships in the data.
+
+The Residual plot supports this conclusion. Residuals are not randomly scattered around zero and their spread increases for higher predicted values, indicating heteroscedasticity. Several large positive residuals show cases where actual fuel efficiency is much higher than predicted.
+
+The third graph illustrates the decrease of AIC during forward selection. A sharp decrease in AIC is visible during the first few steps, especially between steps 1 and 5. This suggests that these are likely the strongest predictors of `comb08`. After approximately steps 6 to 10, the decline in AIC becomes much smaller. Each additional predictor still improves the model slightly, but the gains are modest compared with the first selected features. From around steps 12 to 15 onward, the curve becomes almost flat. This means that adding more predictors provides little additional information.
+
+
+#### Summary
+
+Forward stepwise selection identified 21 statistically significant predictors of `comb08` out of all available candidates. The most influential variables added in the early steps were `displ`, `year`, `drive_Front.Wheel.Drive`, and `fuel_group_Gasoline`, which together account for the largest share of explained variance. The final model achieved R² = 0.678 and RMSE = 3.28 on the test set, with no signs of overfitting as train and test metrics were nearly identical.
+Compared to the non-parametric models trained earlier, forward selection performs considerably worse - Random Forest achieved RMSE = 2.56 and R² = 0.964 on the same data. This gap highlights the limitation of linear feature selection methods when the underlying relationships are non-linear. However, forward selection offers a clear advantage in interpretability, because each coefficient has a direct meaning and statistical significance can be assessed for every predictor, which is not possible with Random Forest or KNN.
 
 ```{r}
 
 ```
 
 ```{r}
-
+#
 ```
 
 ```{r}
