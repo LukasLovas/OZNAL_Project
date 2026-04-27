@@ -858,7 +858,7 @@ From the Residual plot, we can tell that residuals are centered around zero for 
 dt_final %>%
   extract_fit_parsnip() %>%
   vip(num_features = 15) +
-  labs(title = "Feature importance - Decision Tree") +
+  labs(title = "Feature importance - Decision tree") +
   theme_minimal()
 ```
 The graph shows 15 most important features, which were used by model to predict target variable. The most important features are `cylinders` and `displ`.
@@ -1313,7 +1313,29 @@ The Residual plot reveals a clear funnel shape: residuals are tightly clustered 
 Overall, the model performs adequately for typical vehicles but loses precision for fuel-efficient outliers.
 
 ## Feature selection
-xx
+We have already removed redundant, leaking and uninformative features during preprocessing. Feature selection extends the analysis by determining which of the remaining 22 features truly contribute to predicting the target variable and which can be removed without a significant decrease in performance. We compare one algorithmic method (forward selection) and two embedded methods (TODO), then evaluate how many features each retains and whether the reduced feature set preserves predictive performance compared to models trained in previous tasks.
+
+Before applying any formal feature selection method, we first examined feature importance scores from Decision tree and a Random forest models trained on the full feature set. This will provide an initial indication of which predictors carry the most predictive signal.
+
+```{r}
+dt_importance <- dt_final %>%
+  extract_fit_parsnip() %>%
+  vip(num_features = 22) +
+  labs(title = "Feature importance - Decision tree") +
+  theme_minimal()
+
+rf_importance <- rf_final %>%
+  extract_fit_parsnip() %>%
+  vip(num_features = 22) +
+  labs(title = "Feature importance - Random forest") +
+  theme_minimal()
+
+dt_importance + rf_importance + plot_layout(ncol = 2, nrow = 1) 
+```
+Both models agree strongly on the top features: `displ` (engine displacement) and `cylinders` consistently rank as the two most important predictors by a large margin, suggesting that engine size is the primary driver of fuel efficiency. Features `drive_Front.Wheel.Drive` and `year` also appear prominently in both models, indicating that drivetrain type and vehicle age contribute meaningfully to predictions.
+In contrast, manufacturer-level dummy variables such as `make_GMC`, `make_BMW`, `make_Dodge`, and `make_Chevrolet` show near-zero importance in both models, suggesting they add little predictive value.
+
+Overall, the importance rankings are largely consistent across both methods, which increases confidence in the signal and motivates retaining the top features while being selective about low-importance categorical dummies in subsequent selection steps. This gives us a clear starting point for feature selection.
 
 ### Forward stepwise selection
 
