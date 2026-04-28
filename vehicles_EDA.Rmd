@@ -1466,11 +1466,29 @@ Compared to the non-parametric models trained earlier, forward selection perform
 ```
 
 ```{r}
-#
+# ulozenie natrenovanych modelov
+saveRDS(dt_final,     "models/dt_final.rds")
+saveRDS(rf_final,     "models/rf_final.rds")
+saveRDS(knn_final,    "models/knn_final.rds")
+saveRDS(pca_rf_final, "models/pca_rf_final.rds")
+
 ```
 
 ```{r}
+knn_spec <- nearest_neighbor(
+  neighbors = 3,
+  weight_func = "gaussian",
+  dist_power  = 1
+) %>%
+  set_engine("kknn") %>%
+  set_mode("regression")
 
+knn_wf <- workflow() %>%
+  add_recipe(knn_recipe) %>%
+  add_model(knn_spec) %>%
+  fit(data = train_data)
+  
+saveRDS(knn_wf,    "models/knn_final.rds")
 ```
 
 ```{r}
