@@ -9,6 +9,31 @@ library(rpart)
 library(kknn)
 library(vip)
 
+# ── VALIDÁCIA STĹPCOV ─────────────────────────────────────────────────
+required_cols <- c(
+  "fuelType", "fuelType1", "displ", "cylinders", "trany",
+  "drive", "VClass", "year", "make", "comb08"
+)
+
+validate_columns <- function(data) {
+  missing <- setdiff(required_cols, names(data))
+  extra   <- setdiff(names(data), names(vehicles_model))
+  
+  errors <- c()
+  
+  if (length(missing) > 0) {
+    errors <- c(errors, paste("Missing required columns:", paste(missing, collapse = ", ")))
+  }
+  if (length(extra) > 0) {
+    # extra stĺpce nie sú chyba – len upozornenie
+    warning(paste("Extra columns (will be ignored):", paste(extra, collapse = ", ")))
+  }
+  
+  if (length(errors) > 0) stop(paste(errors, collapse = "\n"))
+  invisible(TRUE)
+}
+
+
 # ── PREPROCESSING ─────────────────────────────────────────────────────
 prepare_data <- function(path) {
   data <- read_csv(path, show_col_types = FALSE)
@@ -111,17 +136,17 @@ load_model_safe <- function(path) {
 }
 
 pretrained_models <- list(
-  "Decision Tree"       = load_model_safe("models/dt_final.rds"),
-  "Random Forest"       = load_model_safe("models/rf_final.rds"),
+  "Decision tree"       = load_model_safe("models/dt_final.rds"),
+  "Random forest"       = load_model_safe("models/rf_final.rds"),
   "KNN"                 = load_model_safe("models/knn_final.rds"),
-  "Random Forest + PCA" = load_model_safe("models/pca_rf_final.rds")
+  "Random forest + PCA" = load_model_safe("models/pca_rf_final.rds")
 )
 # Odstráň NULL modely (ktoré ešte neboli natrénované)
 pretrained_models <- Filter(Negate(is.null), pretrained_models)
 
 # ── UI ────────────────────────────────────────────────────────────────
 ui <- fluidPage(
-  titlePanel("Fuel Efficiency Predictor – comb08"),
+  titlePanel("Fuel efficiency prediction"),
   
   tabsetPanel(
     
@@ -132,9 +157,9 @@ ui <- fluidPage(
              br(),
              fluidRow(
                column(4,
-                      fileInput("file", "Upload CSV", accept = ".csv"),
-                      actionButton("load_default", "Use default dataset",
-                                   class = "btn-primary")
+                      h5("The default dataset is automatically loaded."),
+                      hr(),
+                      fileInput("file", "Upload CSV", accept = ".csv")
                ),
                column(8,
                       tableOutput("data_preview")
@@ -145,26 +170,26 @@ ui <- fluidPage(
     # ════════════════════════════════════════════════════
     # TAB 2: Pre-trained Models
     # ════════════════════════════════════════════════════
-    tabPanel("Trained Models",
+    tabPanel("Trained models",
              br(),
              sidebarLayout(
                sidebarPanel(
-                 selectInput("pretrained_model", "Select Model",
-                             choices = names(pretrained_models)),
+                 h5("These models were trained and tuned in the project R markdown file."),
                  hr(),
-                 h5("These models were trained and tuned in the project R markdown file.")
+                 selectInput("pretrained_model", "Select model",
+                             choices = names(pretrained_models))
                ),
                mainPanel(
-                 h4("Performance Metrics"),
+                 h4("Performance metrics"),
                  tableOutput("pretrained_metrics"),
                  hr(),
                  h4("Actual vs Predicted"),
                  plotOutput("pretrained_actual_vs_pred"),
                  hr(),
-                 h4("Residual Plot"),
+                 h4("Residual plot"),
                  plotOutput("pretrained_residuals"),
                  hr(),
-                 h4("Feature Importance"),
+                 h4("Feature importance"),
                  plotOutput("pretrained_importance")
                )
              )
@@ -173,7 +198,7 @@ ui <- fluidPage(
     # ════════════════════════════════════════════════════
     # TAB 3: Custom Model (auto-update)
     # ════════════════════════════════════════════════════
-    tabPanel("Custom Model",
+    tabPanel("Custom model",
              br(),
              sidebarLayout(
                sidebarPanel(
@@ -182,12 +207,12 @@ ui <- fluidPage(
                  hr(),
                  
                  # Model type
-                 selectInput("model_type", "Select Model",
-                             choices = c("Linear Regression" = "lm",
+                 selectInput("model_type", "Select model",
+                             choices = c("Linear regression" = "lm",
                                          "Lasso"             = "lasso",
                                          "Ridge"             = "ridge",
-                                         "Random Forest"     = "rf",
-                                         "Decision Tree"     = "dt",
+                                         "Random forest"     = "rf",
+                                         "Decision tree"     = "dt",
                                          "KNN"               = "knn")),
                  
                  # Lasso / Ridge parameters
@@ -200,33 +225,43 @@ ui <- fluidPage(
                  # Random Forest parameters
                  conditionalPanel(
                    condition = "input.model_type == 'rf'",
-                   sliderInput("trees", "Number of Trees",
-                               min = 50, max = 500, value = 100, step = 50),
-                   sliderInput("mtry", "mtry (features per split)",
-                               min = 2, max = 22, value = 5, step = 1)
+                   sliderInput("trees", "trees",
+                               min = 50, max = 500, value = 200, step = 50),
+                   sliderInput("mtry", "mtry",
+                               min = 2, max = 22, value = 10, step = 1),
+                   sliderInput("min_n_rf", "min_n",
+                               min = 2, max = 20, value = 2, step = 1)
                  ),
                  
                  # Decision Tree parameters
                  conditionalPanel(
                    condition = "input.model_type == 'dt'",
-                   sliderInput("tree_depth", "Tree Depth",
-                               min = 3, max = 15, value = 8, step = 1),
-                   sliderInput("min_n_dt", "Min Node Size",
+                   sliderInput("cost_complexity", "cost_complexity",
+                               min = 0.0001, max = 0.1, value = 0.0001, step = 0.0001),
+                   sliderInput("tree_depth", "tree_depth",
+                               min = 3, max = 15, value = 15, step = 1),
+                   sliderInput("min_n_dt", "min_n",
                                min = 2, max = 20, value = 8, step = 1)
                  ),
                  
                  # KNN parameters
                  conditionalPanel(
                    condition = "input.model_type == 'knn'",
-                   sliderInput("neighbors", "Number of Neighbors",
-                               min = 3, max = 25, value = 5, step = 1)
+                   sliderInput("neighbors", "neighbors",
+                               min = 3, max = 25, value = 3, step = 1),
+                   selectInput("weight_func", "weight_func",
+                               choices = c("rectangular", "triangular", "gaussian"),
+                               selected = "gaussian"),
+                   radioButtons("dist_power", "dist_power",
+                                choices = c("1" = 1, "2" = 2),
+                                selected = 1, inline = TRUE)
                  ),
                  
                  hr(),
                  
                  # Feature space
-                 selectInput("feature_space", "Feature Space",
-                             choices = c("Full features" = "full",
+                 selectInput("feature_space", "Feature space",
+                             choices = c("Full features (22 predictors)" = "full",
                                          "PCA"           = "pca")),
                  conditionalPanel(
                    condition = "input.feature_space == 'pca'",
@@ -240,16 +275,16 @@ ui <- fluidPage(
                ),
                
                mainPanel(
-                 h4("Performance Metrics"),
+                 h4("Performance metrics"),
                  tableOutput("metrics"),
                  hr(),
                  h4("Actual vs Predicted"),
                  plotOutput("actual_vs_pred"),
                  hr(),
-                 h4("Residual Plot"),
+                 h4("Residual plot"),
                  plotOutput("residual_plot"),
                  hr(),
-                 h4("Feature Importance"),
+                 h4("Feature importance"),
                  plotOutput("importance_plot")
                )
              )
@@ -271,12 +306,31 @@ server <- function(input, output, session) {
   })
   
   observeEvent(input$file, {
-    tryCatch({
-      data_r(prepare_data(input$file$datapath))
-      showNotification("File loaded and preprocessed.", type = "message", duration = 2)
-    }, error = function(e) {
-      showNotification(paste("Error loading file:", e$message), type = "error")
-    })
+    raw <- tryCatch(
+      read_csv(input$file$datapath, show_col_types = FALSE),
+      error = function(e) {
+        showNotification("Could not read the file. Please upload a valid CSV.", 
+                         type = "error", duration = 5)
+        NULL
+      }
+    )
+    
+    req(raw)
+    
+    missing <- setdiff(required_cols, names(raw))
+    
+    if (length(missing) > 0) {
+      showNotification(
+        paste0("File cannot be used, becuase it is missing some of the required columns: ", 
+               paste(missing, collapse = ", ")),
+        type     = "error",
+        duration = 8
+      )
+      return()
+    }
+    
+    data_r(prepare_data(input$file$datapath))
+    showNotification("File loaded successfully.", type = "message", duration = 2)
   })
   
   output$data_preview <- renderTable({
@@ -329,7 +383,7 @@ server <- function(input, output, session) {
       fit %>%
         extract_fit_parsnip() %>%
         vip::vip(num_features = 15) +
-        labs(title = paste("Feature Importance –", input$pretrained_model)) +
+        labs(title = paste("Feature importance –", input$pretrained_model)) +
         theme_minimal()
     }, error = function(e) {
       plot.new()
@@ -348,7 +402,11 @@ server <- function(input, output, session) {
       n_comp        = input$n_comp,
       neighbors     = input$neighbors,
       tree_depth    = input$tree_depth,
-      min_n_dt      = input$min_n_dt
+      min_n_dt      = input$min_n_dt,
+      min_n_rf       = input$min_n_rf,
+      cost_complexity = input$cost_complexity,
+      weight_func    = input$weight_func,
+      dist_power     = input$dist_power
     )
   })
   
@@ -378,13 +436,19 @@ server <- function(input, output, session) {
                      lm    = linear_reg() %>% set_engine("lm"),
                      lasso = linear_reg(penalty = params$penalty, mixture = 1) %>% set_engine("glmnet"),
                      ridge = linear_reg(penalty = params$penalty, mixture = 0) %>% set_engine("glmnet"),
-                     rf    = rand_forest(trees = params$trees, mtry = params$mtry) %>%
+                     rf  = rand_forest(trees = params$trees, mtry = params$mtry,
+                                       min_n = params$min_n_rf) %>%
                        set_mode("regression") %>%
                        set_engine("ranger", importance = "impurity"),
-                     dt    = decision_tree(tree_depth = params$tree_depth,
-                                           min_n = params$min_n_dt) %>%
+                     
+                     dt  = decision_tree(cost_complexity = params$cost_complexity,
+                                         tree_depth      = params$tree_depth,
+                                         min_n           = params$min_n_dt) %>%
                        set_mode("regression") %>% set_engine("rpart"),
-                     knn   = nearest_neighbor(neighbors = params$neighbors) %>%
+                     
+                     knn = nearest_neighbor(neighbors   = params$neighbors,
+                                            weight_func = params$weight_func,
+                                            dist_power  = as.numeric(params$dist_power)) %>%
                        set_mode("regression") %>% set_engine("kknn")
       )
       
@@ -452,7 +516,8 @@ server <- function(input, output, session) {
         theme_minimal()
     }, error = function(e) {
       plot.new()
-      text(0.5, 0.5, "Feature importance not available for this model type.", cex = 1.2)
+      text(0.5, 0.5, "Feature importance not available for this model type.",
+           cex = 1.2, col = "gray50")
     })
   })
 }
