@@ -219,6 +219,7 @@ cor_matrix <- num_data %>%
 
 cor_matrix
 ggcorrplot(cor_matrix)
+saveRDS(cor_matrix, "models/cor_matrix.rds")
 ```
 
 -   Target `comb08` is highly positively correlated with:

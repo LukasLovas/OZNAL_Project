@@ -8,6 +8,8 @@ library(forcats)
 library(rpart)
 library(kknn)
 library(vip)
+library(ggcorrplot)
+library(shinydashboard)
 
 # ── VALIDÁCIA STĹPCOV ─────────────────────────────────────────────────
 required_cols <- c(
@@ -143,6 +145,7 @@ pretrained_models <- list(
 )
 # Odstráň NULL modely (ktoré ešte neboli natrénované)
 pretrained_models <- Filter(Negate(is.null), pretrained_models)
+cor_matrix <- readRDS("models/cor_matrix.rds")
 
 # ── UI ────────────────────────────────────────────────────────────────
 ui <- fluidPage(
@@ -160,11 +163,41 @@ ui <- fluidPage(
                       h5("The default dataset is automatically loaded."),
                       hr(),
                       fileInput("file", "Upload CSV", accept = ".csv")
-               ),
-               column(8,
-                      tableOutput("data_preview")
                )
-             )
+             ),
+             hr(),
+             
+             # ── Basic info ──
+             h4("Dataset overview"),
+             fluidRow(
+               column(3, valueBoxOutput("n_rows",    width = 12)),
+               column(3, valueBoxOutput("n_cols",    width = 12)),
+               column(3, valueBoxOutput("n_train",   width = 12)),
+               column(3, valueBoxOutput("n_test",    width = 12))
+             ),
+             hr(),
+             
+             # ── Data preview ──
+             h4("Data preview"),
+             tableOutput("data_preview"),
+             hr(),
+             
+             # ── comb08 distribution ──
+             h4("Target variable: comb08"),
+             fluidRow(
+               column(6, plotOutput("eda_histogram")),
+               column(6, plotOutput("eda_boxplot"))
+             ),
+             hr(),
+             
+             # ── Train vs Test ──
+             h4("Train vs Test distribution"),
+             plotOutput("eda_train_test"),
+             hr(),
+             
+             # ── Correlation matrix ──
+             h4("Correlation matrix"),
+             plotOutput("eda_correlation", height = "500px")
     ),
     
     # ════════════════════════════════════════════════════
@@ -519,6 +552,56 @@ server <- function(input, output, session) {
       text(0.5, 0.5, "Feature importance not available for this model type.",
            cex = 1.2, col = "gray50")
     })
+  })
+  
+  # ── Value boxes ──────────────────────────────────────────────────────
+  output$n_rows  <- renderValueBox({
+    valueBox(nrow(vehicles_model), "Total rows")
+  })
+  output$n_cols  <- renderValueBox({
+    valueBox(ncol(vehicles_model), "Total columns")
+  })
+  output$n_train <- renderValueBox({
+    valueBox(nrow(train_data), "Train rows")
+  })
+  output$n_test  <- renderValueBox({
+    valueBox(nrow(test_data), "Test rows")
+  })
+  
+  # ── Histogram ────────────────────────────────────────────────────────
+  output$eda_histogram <- renderPlot({
+    ggplot(vehicles_model, aes(x = comb08)) +
+      geom_histogram(bins = 40, fill = "steelblue", color = "white") +
+      labs(x = "comb08 (MPG)", y = "Count", title = "Distribution of comb08") +
+      theme_minimal()
+  })
+  
+  # ── Boxplot ──────────────────────────────────────────────────────────
+  output$eda_boxplot <- renderPlot({
+    ggplot(vehicles_model, aes(y = comb08)) +
+      geom_boxplot(fill = "steelblue", alpha = 0.7) +
+      coord_flip() +
+      labs(y = "comb08 (MPG)", title = "Boxplot of comb08") +
+      theme_minimal()
+  })
+
+  # ── Train vs Test ────────────────────────────────────────────────────
+  output$eda_train_test <- renderPlot({
+    bind_rows(
+      train_data %>% select(comb08) %>% mutate(split = "Train"),
+      test_data  %>% select(comb08) %>% mutate(split = "Test")
+    ) %>%
+      ggplot(aes(x = comb08, fill = split)) +
+      geom_density(alpha = 0.5) +
+      scale_fill_manual(values = c("Train" = "steelblue", "Test" = "tomato")) +
+      labs(x = "comb08 (MPG)", y = "Density",
+           title = "Train vs Test distribution") +
+      theme_minimal()
+  })
+  
+  # ── Correlation matrix ───────────────────────────────────────────────
+  output$eda_correlation <- renderPlot({
+    ggcorrplot(cor_matrix)
   })
 }
 
