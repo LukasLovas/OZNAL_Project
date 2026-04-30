@@ -461,12 +461,12 @@ cat("Total columns scheduled for removal:", length(cols_to_remove), "\n")
 
 ### Electric Vehicles
 
-Electric vehicles do not have a combustion engine and therefore have no `displ` or `cylinders`. Their missing values are structurally meaningful — they signal the absence of an engine, not random data loss. We capture this before any imputation.
+Electric vehicles do not have a combustion engine and therefore have no `displ` or `cylinders`. Their missing values are structurally meaningful — they signal the absence of an engine.
 
 -   `is_electric`: TRUE if the vehicle runs on electricity only.
 -   `has_combustion_engine`: TRUE if the vehicle has a combustion engine.
 
-For EVs, `displ` and `cylinders` are set to 0 — meaning zero displacement, not a statistical fill-in. Remaining missing values in non-EV rows will be handled later by the recipe.
+For EVs, `displ` and `cylinders` are set to 0 — meaning zero displacement, not a statistical fill-in.
 
 ```{r}
 data_fe <- data %>%
@@ -578,7 +578,7 @@ print(table(data_fe$has_discrete_gears))
 
 ### Build Final Modeling Dataset
 
-We apply all column removals. Pure battery electric vehicles (BEVs) are excluded from the modeling dataset before the train/test split. The target variable `comb08` represents Miles Per Gallon (MPG) for combustion-engine vehicles, but for Electric Vehicles the MPG is converted to MPGe — an artificial conversion. That does not reflect actual fuel consumption, which means including these vehicles that have two structurally different aspects in a single regression target would only harm the prediction.
+We apply all column removals. Pure battery electric vehicles are excluded from the modeling dataset before the train/test split. The target variable `comb08` represents Miles Per Gallon (MPG) for combustion-engine vehicles, but for Electric Vehicles the MPG is converted to MPGe — an artificial conversion. That does not reflect actual fuel consumption, which means including these vehicles that have two structurally different aspects in a single regression target would only harm the prediction.
 
 ```{r}
 n_ev <- sum(data_fe$is_electric)
@@ -817,7 +817,6 @@ ridge_cv <- ridge_wf %>%
     metrics   = eval_metrics
   )
 
-autoplot(ridge_cv)
 ```
 
 At very low penalty, Ridge behaves like OLS. As penalty increases, coefficients shrink and the model has higher bias but less variance. The optimal result is where RMSE on the folds is minimized.
@@ -866,7 +865,7 @@ Compared to OLS, Ridge produces smaller coefficient weights across all predictor
 
 #### 3. LASSO Regression
 
-LASSO (Least Absolute Shrinkage and Selection Operator) uses an L1 penalty — λ × Σ\|β\|. The key geometric property of L1 is that the regularized solution often lands exactly at zero for many coefficients. LASSO therefore performs simultaneous regression and feature selection: it automatically identifies the most informative predictors and removes the rest.
+LASSO (Least Absolute Shrinkage and Selection Operator) uses an L1 penalty. The key property of L1 is that the regularization can scale the coefficients to zero. LASSO performs simultaneous regression and feature selection: it automatically identifies the most informative predictors and removes the rest.
 
 ```{r}
 lasso_spec <- linear_reg(penalty = tune(), mixture = 1) %>%
@@ -878,7 +877,7 @@ lasso_wf <- workflow() %>%
   add_model(lasso_spec)
 ```
 
-LASSO typically needs smaller penalties than Ridge to achieve similar shrinkage, so we search a narrower range.
+Giving LASSO the same penalty range as Ridge would only harm the prediction, because scaling too many predictors to 0 could introduce underfitting.
 
 ```{r}
 lasso_grid <- grid_regular(penalty(range = c(-4, 0)), levels = 50)
@@ -892,7 +891,6 @@ lasso_cv <- lasso_wf %>%
     metrics   = eval_metrics
   )
 
-autoplot(lasso_cv)
 ```
 
 ```{r}
@@ -910,8 +908,6 @@ lasso_final_wf <- lasso_wf %>% finalize_workflow(best_lasso)
 lasso_fit       <- lasso_final_wf %>% fit(data = train_data)
 ```
 
-One of LASSO's main advantages is sparsity. Let's see how many predictors it retained.
-
 ```{r}
 lasso_coefs <- lasso_fit %>%
   extract_fit_parsnip() %>%
@@ -920,8 +916,8 @@ lasso_coefs <- lasso_fit %>%
 
 cat("=== LASSO — sparsity ===\n")
 cat("Total predictors available:", nrow(lasso_coefs), "\n")
-cat("Kept by LASSO (non-zero):  ", sum(lasso_coefs$estimate != 0), "\n")
-cat("Removed by LASSO (zero):   ", sum(lasso_coefs$estimate == 0), "\n")
+cat("Kept by LASSO:  ", sum(lasso_coefs$estimate != 0), "\n")
+cat("Removed by LASSO:   ", sum(lasso_coefs$estimate == 0), "\n")
 if (sum(lasso_coefs$estimate == 0) > 0) {
   cat("Zeroed out predictors:\n")
   print(lasso_coefs %>% filter(estimate == 0) %>% pull(term))
@@ -949,13 +945,13 @@ lasso_coefs %>%
   theme_minimal()
 ```
 
-LASSO retains only the most informative predictors, which makes the resulting model more parsimonious and directly interpretable compared to OLS or Ridge. Predictors that survive the L1 penalty are the ones that the algorithm judged worth the cost of adding a parameter.
+Predictors that survive the L1 penalty are the ones that the algorithm judged worth the cost of adding a parameter.
 
 ------------------------------------------------------------------------
 
 #### 4. Elastic Net
 
-Elastic Net combines both L1 and L2 penalties: λ × [α × Σ\|β\| + (1 − α) × Σβ²]. The `mixture` parameter in tidymodels corresponds to α: `mixture = 0` gives pure Ridge, `mixture = 1` gives pure LASSO. By tuning both `penalty` and `mixture`, Elastic Net finds the best blend — it can perform feature selection like LASSO while also handling correlated predictors like Ridge.
+Elastic Net combines both L1 and L2 penalties. The `mixture` parameter corresponds to α: `mixture = 0` gives pure Ridge, `mixture = 1` gives pure LASSO. By tuning both `penalty` and `mixture`, Elastic Net finds the best combination — it can perform feature selection like LASSO while also handling correlated predictors like Ridge.
 
 ```{r}
 en_spec <- linear_reg(penalty = tune(), mixture = tune()) %>%
@@ -967,8 +963,7 @@ en_wf <- workflow() %>%
   add_model(en_spec)
 ```
 
-We use a regular 10 × 10 grid — 10 penalty values and 10 mixture values — giving 100 combinations. `glmnet` evaluates all penalty values for each mixture in a single path, so this is still fast.
-
+We use a regular 10 × 10 grid — 10 penalty values and 10 mixture values — giving 100 combinations. This should leave enough space to choose the best combination without limiting one either penalty or mixture.
 ```{r}
 en_grid <- grid_regular(
   penalty(range = c(-4, 0)),
@@ -985,7 +980,6 @@ en_cv <- en_wf %>%
     metrics   = eval_metrics
   )
 
-autoplot(en_cv)
 ```
 
 ```{r}
@@ -1000,7 +994,7 @@ cat("CV RMSE:     ", round(en_best_row$mean, 4),
     "  ±", round(en_best_row$std_err, 4), "\n")
 ```
 
-The optimal `mixture` value tells us how the data prefers to be regularized. If the best mixture is close to 1, LASSO-like behavior is preferred; if it is close to 0, Ridge-like behavior is preferred.
+The optimal `mixture` value tells us how the data should to be regularized. If the best mixture is close to 1, LASSO-like behavior is preferred; if it is close to 0, Ridge-like behavior is preferred.
 
 ```{r}
 en_final_wf <- en_wf %>% finalize_workflow(best_en)
@@ -1011,9 +1005,7 @@ en_fit       <- en_final_wf %>% fit(data = train_data)
 
 #### Comparing All Parametric Models
 
-We evaluate all four models on the held-out test set. Because each model is a full `workflow()` that includes the preprocessing recipe, we pass the raw `test_data` directly and the recipe transformations are applied automatically.
-
-We write a small helper function so we do not repeat the same prediction + metric code four times.
+We evaluate all four models on the held-out test set.
 
 ```{r}
 get_test_metrics <- function(fit, model_name) {
@@ -1041,24 +1033,6 @@ test_comparison <- bind_rows(
 test_comparison
 ```
 
-```{r}
-test_comparison %>%
-  pivot_longer(cols = c(RMSE, MAE, Rsq),
-               names_to  = "metric",
-               values_to = "value") %>%
-  ggplot(aes(x = reorder(model, value), y = value, fill = model)) +
-  geom_col(show.legend = FALSE) +
-  facet_wrap(~metric, scales = "free_x") +
-  coord_flip() +
-  labs(
-    title = "Test Set Performance: Parametric Models",
-    x     = NULL,
-    y     = "Value"
-  ) +
-  theme_minimal()
-```
-
-Lower RMSE and MAE are better; higher R² is better.
 
 ##### Cross-Validation vs. Test Set RMSE
 
@@ -1084,11 +1058,9 @@ cv_rmse_comparison <- tibble(
 cv_rmse_comparison
 ```
 
-A small `gap` confirms no overfitting.
-
 ##### Actual vs. Predicted — All Models
 
-Actual vs. predicted on the test set. Points on the red diagonal = perfect prediction.
+Actual vs. predicted on the test set.
 
 ```{r}
 all_test_preds <- bind_rows(
@@ -1111,58 +1083,32 @@ all_test_preds %>%
   theme_minimal()
 ```
 
-With BEVs excluded, all values are real MPG. The fan-shaped distortion from MPGe outliers is gone. Remaining scatter at high MPG values is mostly PHEVs and efficient compacts — the model slightly underpredicts these.
-
-------------------------------------------------------------------------
-
-#### Summary: Parametric Models
-
-All four models assume a linear relationship. They differ only in regularization:
-
-| Model       | Penalty | Sparsity |
-|-------------|---------|----------|
-| OLS         | None    | No       |
-| Ridge       | L2      | No       |
-| LASSO       | L1      | Yes      |
-| Elastic Net | L1 + L2 | Yes      |
-
-On large datasets the differences are small. Regularization stabilizes coefficients; LASSO additionally zeroes out weak predictors.
+Remaining scattered observations at high MPG values is mostly hybrid vehicles or vehicle models made with efficiency in mind — the model slightly underpredicts these.
 
 ------------------------------------------------------------------------
 
 #### Conclusion
 
-##### Effect of removing electric vehicles
-
-Removing 1 425 BEVs (whose `comb08` values are MPGe, not MPG) gives the linear models a cleaner MPG-only target. In the current run, the OLS baseline achieves **RMSE = 3.28 MPG, MAE = 2.16 MPG and R² = 0.677** on the test set.
-
 ##### Model results
 
-All four models gave nearly the same result on the test set: **RMSE ≈ 3.28 MPG, MAE ≈ 2.16 MPG, R² ≈ 0.677**. With a median `comb08` of 20 MPG, an average error of 2.16 MPG is roughly 11% — reasonable for a linear model with 22 features.
+All four models gave nearly the same result on the test set: **RMSE ≈ 3.28 MPG, MAE ≈ 2.16 MPG, R² ≈ 0.677**. With a median `comb08` of 20 MPG, an average error of 2.16 MPG is roughly 11%.
 
 ##### Why regularization did not help
 
-All three regularized models selected `penalty = 0.0001` — the minimum of the search grid. With 38 735 training observations and only 22 predictors, there is very little variance to reduce, so regularization has almost nothing to do. LASSO also kept all 22 predictors for the same reason — at such a small penalty, no predictor is weak enough to be zeroed out. This is not a bad result; it means the feature set is clean and every variable carries real signal.
+All three regularized models selected `penalty = 0.0001` — the minimum of the penalty value set. At such a small penalty, no predictor is weak enough to be zeroed out. This means the feature set is clean and every variable carries real signal.
 
-##### Where the models fall short
+The baseline linear models assume that each predictor contributes independently to MPG. This is likely too restrictive for our vehicle data. The effect of engine displacement may depend on cylinder count, vehicle year, or transmission structure, because the same increase in engine size can have different consequences for different engine designs. Interaction terms could allow the model to consider these relationships.
 
--   The relationship between engine size and MPG is not perfectly linear — adding a cylinder to a small 4-cylinder engine is different from adding one to a V8.
--   PHEVs and mild hybrids behave differently depending on driving mode, which no single feature captures.
--   Vehicle weight and aerodynamic drag are not in the dataset, even though they strongly affect fuel economy.
+The CV–test gap is below 0.005 for all models, so there is no overfitting. The models are a decent baseline.
 
-The CV–test gap is below 0.005 for all models, so there is no overfitting. The models are a solid baseline — interpretable, stable, and easy to explain.
+#### Scenario 2 Extension: Attempt to improve Parametric models with interaction terms
 
-#### 2.5 Extension: interaction terms
+Since Ridge, LASSO and Elastic Net did not improve meaningfully over the OLS baseline, we extend OLS with four interpretable interaction terms. These interactions test whether engine-size effects depend on engine architecture, vehicle age and transmission structure.
 
-The four parametric models above are linear in the predictors. Since Ridge, LASSO and Elastic Net did not improve meaningfully over the OLS baseline, we extend OLS with four interpretable interaction terms. These interactions test whether engine-size effects depend on engine architecture, vehicle age and transmission structure.
-
-The interaction terms were chosen from domain logic rather than by testing every possible combination:
-
--   `cylinders:displ` checks whether the MPG effect of engine displacement changes with engine architecture. A 3.0L engine with fewer cylinders may behave differently from a 3.0L engine with more cylinders.
--   `displ:year` checks whether the effect of engine size changed over time, because newer engines can use better combustion, turbocharging and efficiency technology.
+-   `cylinders:displ` checks whether the MPG effect of engine displacement changes with engine architecture.
+-   `displ:year` checks whether the effect of engine size changed over time, because newer engines can use more efficient technology.
 -   `cylinders:year` checks whether the MPG penalty of additional cylinders differs across vehicle generations.
--   `displ:has_discrete_gears` checks whether the effect of engine size depends on transmission structure. Vehicles with discrete gears may use engine displacement differently than CVT or other non-discrete transmissions.
-
+-   `displ:has_discrete_gears` checks whether the effect of engine size depends on transmission structure.
 ```{r}
 rec_interact <- recipe(comb08 ~ ., data = train_data) %>%
   step_novel(all_nominal_predictors()) %>%
@@ -1221,7 +1167,19 @@ cat("\n=== Interaction coefficients ===\n")
 print(interaction_terms)
 ```
 
-The four interaction terms test whether the effect of engine displacement and cylinder count changes across vehicle age and transmission structure. If these terms reduce test RMSE without increasing the train-test gap substantially, they indicate that the linear baseline was missing simple non-additive relationships.
+Adding the four interaction terms improved the OLS test performance from RMSE = 3.28 to RMSE = 3.13 and increased R² from 0.677 to 0.706. This means that the main limitation of the original linear model is its purely additive structure. The baseline OLS model assumes that the effect of each predictor is constant regardless of the values of the other predictors.
+
+The strongest interaction is `cylinders:displ`, which is highly significant. This confirms that the MPG penalty of displacement depends on the number of cylinders.
+
+ The interaction `displ:has_discrete_gears` is also significant, suggesting that the effect of engine size differs between vehicles with discrete gears and vehicles with CVT or other non-discrete transmissions.
+ 
+  The `displ:year` interaction is significant as well, which indicates that the relationship between engine size and MPG changed over time, likely because newer engine technologies improved efficiency.
+
+The only weak interaction is `cylinders:year`, whose p-value is not significant.
+
+This result shows non-parametric regression that are more flexible should perform a lot better because they can learn non-linear and interaction effects automatically instead of requiring us to specify them.
+
+
 
 ### Non-parametric regression methods
 
@@ -1761,36 +1719,16 @@ Forward stepwise selection identified 21 statistically significant predictors of
 
 ### Embedded methods
 
-Embedded methods integrate feature selection into model training itself — the algorithm simultaneously learns which features matter and what their coefficients are. This differs from filter methods (which score features independently of any model) and wrapper methods (which train a model for each candidate subset).
+Embedded methods integrate feature selection into model training itself — the algorithm simultaneously learns which features matter and what their coefficients are.
 
 Two models from Scenario 2 are embedded methods by design:
 
--   **LASSO** (L1 penalty): the L1 geometry causes the optimization to land exactly at zero for weak predictors. The regularization path records which features enter or leave the model as λ grows.
--   **Elastic Net** (L1 + L2): inherits LASSO's sparsity while distributing weight more evenly among correlated predictors like `displ` and `cylinders`.
+-   **LASSO** (L1 penalty)
+-   **Elastic Net** (L1 + L2) 
 
-OLS has no regularization — no selection. Ridge (L2 only) shrinks coefficients toward zero but never reaches exactly zero — not an embedded selector.
+Because both models were already fitted in Scenario 2, we can reuse them.
 
-Because both models were already fitted in Scenario 2, no new training is needed. We inspect their embedded selection behavior directly.
-
-#### 3.1 Which Scenario 2 models qualify as embedded?
-
-We classify the four Scenario 2 models to justify why LASSO and Elastic Net are selected for Scenario 3.
-
-```{r}
-model_classification <- tibble(
-  model        = c("Linear Regression", "Ridge", "LASSO", "Elastic Net"),
-  penalty_type = c("None", "L2 only", "L1", "L1 + L2"),
-  zeros_coefs  = c("No", "No", "Yes", "Yes"),
-  embedded     = c("No", "No", "YES", "YES")
-)
-
-cat("=== Scenario 2 models — embedded method classification ===\n")
-print(model_classification)
-cat("\nSelected for Scenario 3: LASSO and Elastic Net\n")
-cat("(best-performing embedded-eligible models from Scenario 2 — test RMSE ≈ 3.28 MPG)\n")
-```
-
-#### 3.2 LASSO — Regularization Path
+#### LASSO — Regularization Path
 
 The regularization path shows how many features the model keeps as the penalty λ grows. At λ → 0 all features are retained (same as OLS). As λ increases, the L1 geometry forces progressively more coefficients to exactly zero. The CV-optimal λ is marked — this is where Scenario 2's cross-validation stopped.
 
@@ -1801,6 +1739,12 @@ opt_log_lasso <- log10(best_lasso$penalty)
 path_lasso <- tibble(
   log_lambda = log10(lasso_glmnet$lambda),
   n_selected = lasso_glmnet$df   # non-zero coefficients at each lambda
+)
+
+path_lasso <- bind_rows(
+  tibble(log_lambda = c(opt_log_lasso, min(path_lasso$log_lambda) - 0.01),
+         n_selected = max(path_lasso$n_selected)),
+  path_lasso
 )
 
 cat("=== LASSO — regularization path summary ===\n")
@@ -1830,9 +1774,9 @@ ggplot(path_lasso, aes(x = log_lambda, y = n_selected)) +
   theme_minimal()
 ```
 
-The path shows what LASSO does as an embedded selector: at low λ all features are kept; as λ grows, the weakest predictors drop out one by one. The CV-optimal λ sits at the left end of the path — meaning the 5-fold CV found that keeping all (or nearly all) features produces the lowest prediction error on this dataset.
+The CV-optimal λ is at the left end of the path — meaning the 5-fold CV found that keeping all (or nearly all) features produces the lowest prediction error on this dataset.
 
-#### 3.3 LASSO — Selected Features at Optimal λ
+#### LASSO — Selected Features at Optimal λ
 
 These are the predictors LASSO kept at the CV-optimal penalty. A zero coefficient means the model decided that feature adds no useful information given the others.
 
@@ -1880,7 +1824,7 @@ lasso_coefs_s3 %>%
 
 #### 3.4 Elastic Net — Regularization Path
 
-Elastic Net mixes L1 and L2 penalties. The optimal mixture was found by CV in Scenario 2 (jointly tuning both `penalty` and `mixture`). We show its path using the same approach as LASSO.
+Elastic Net mixes L1 and L2 penalties. The optimal mixture was found by CV in Scenario 2.
 
 ```{r}
 en_glmnet  <- en_fit %>% extract_fit_engine()
@@ -1891,17 +1835,6 @@ path_en <- tibble(
   n_selected = en_glmnet$df
 )
 
-cat("=== Elastic Net — regularization path summary ===\n")
-cat("Optimal penalty (λ):", round(best_en$penalty, 6), "\n")
-cat("Optimal mixture (α):", round(best_en$mixture, 4),
-    " (0 = Ridge, 1 = LASSO)\n")
-cat("Features at λ_min (≈ OLS):   ",
-    path_en$n_selected[which.min(path_en$log_lambda)], "\n")
-cat("Features at λ_opt (CV best): ",
-    path_en$n_selected[which.min(abs(path_en$log_lambda - opt_log_en))], "\n")
-cat("Features at λ_max (max reg): ",
-    path_en$n_selected[which.max(path_en$log_lambda)], "\n")
-
 ggplot(path_en, aes(x = log_lambda, y = n_selected)) +
   geom_line(color = "#27AE60", linewidth = 0.8) +
   geom_vline(xintercept = opt_log_en, color = "tomato", lty = 2) +
@@ -1911,7 +1844,7 @@ ggplot(path_en, aes(x = log_lambda, y = n_selected)) +
            label = paste0("λ_opt = ", round(best_en$penalty, 5)),
            color = "tomato", hjust = 0, size = 3.5) +
   labs(
-    title    = "Elastic Net — number of selected features along the regularization path",
+    title    = "Elastic Net — regularization path",
     subtitle = paste0("Red dashed line = CV-optimal λ  |  α = ",
                       round(best_en$mixture, 3), "  (0 = Ridge, 1 = LASSO)"),
     x        = "log₁₀(λ)",
@@ -1966,7 +1899,7 @@ en_coefs_s3 %>%
 
 #### 3.6 Comparing LASSO vs. Elastic Net Feature Selection
 
-We compare which features each model kept and where they agree. Features retained by both are the most robustly selected — they carry enough signal to survive both pure L1 and blended L1+L2 penalization.
+We compare which features each model kept and where they agree. Features retained by both carry enough signal to survive both pure L1 and combined L1+L2 penalization.
 
 ```{r}
 selection_comparison <- lasso_coefs_s3 %>%
@@ -1989,7 +1922,7 @@ selection_comparison <- lasso_coefs_s3 %>%
 cat("=== LASSO vs. Elastic Net — selection agreement ===\n")
 print(table(selection_comparison$agreement))
 
-cat("\n--- Features selected by BOTH models (top 10 by |LASSO coef|) ---\n")
+cat("\n--- Features selected by BOTH models ---\n")
 selection_comparison %>%
   filter(agreement == "Both selected") %>%
   arrange(desc(abs(lasso))) %>%
@@ -2020,7 +1953,7 @@ selection_comparison %>%
 
 #### 3.7 Test Set Performance
 
-We evaluate both models on the held-out test set, showing prediction accuracy alongside the number of features used — the embedded selection framing.
+We evaluate both models on the test set, showing prediction accuracy alongside the number of features used — the embedded selection.
 
 ```{r}
 lasso_test_s3 <- lasso_fit %>%
@@ -2060,104 +1993,25 @@ test_comparison %>%
   print()
 ```
 
-#### 3.8 Extension: extended penalty grid (sparsity vs. accuracy)
+#### 3.8 Extended penalty range
 
-The original Scenario 2 grid (`penalty(range = c(-4, 0))`) topped out at λ = 1, and CV picked λ = 1e-4 — the smallest value — which zeroed no features. The regularization path plot in §3.2 hinted at what would happen at higher λ, but we never measured the prediction error along that path. Here we re-tune LASSO over a much wider grid (10⁻⁴ to 10¹) and read off, for each λ, both the number of selected features and the test RMSE — the actual sparsity-vs-accuracy tradeoff.
-
-```{r warning=FALSE}
-lasso_grid_wide <- grid_regular(penalty(range = c(-4, 1)), levels = 25)
-
-lasso_cv_wide <- lasso_wf %>%
-  tune_grid(
-    resamples = folds,
-    grid      = lasso_grid_wide,
-    metrics   = eval_metrics
-  )
-
-cv_rmse_wide <- collect_metrics(lasso_cv_wide) %>%
-  filter(.metric == "rmse") %>%
-  select(penalty, cv_rmse = mean)
-```
-
-```{r warning=FALSE}
-sparsity_path <- map_dfr(lasso_grid_wide$penalty, function(lam) {
-  fit_l <- lasso_wf %>%
-    finalize_workflow(tibble(penalty = lam)) %>%
-    fit(train_data)
-
-  betas <- fit_l %>%
-    extract_fit_parsnip() %>%
-    tidy() %>%
-    filter(term != "(Intercept)")
-
-  pred_l <- predict(fit_l, new_data = test_data) %>%
-    bind_cols(test_data %>% select(comb08))
-
-  tibble(
-    penalty    = lam,
-    log_lambda = log10(lam),
-    n_selected = sum(betas$estimate != 0),
-    test_rmse  = rmse_vec(truth = pred_l$comb08, estimate = pred_l$.pred)
-  )
-}) %>%
-  left_join(cv_rmse_wide, by = "penalty")
-
-cat("=== LASSO — sparsity vs. accuracy across λ ===\n")
-print(sparsity_path %>%
-        mutate(across(c(cv_rmse, test_rmse, log_lambda), ~round(., 4))))
-```
+The CV-optimal LASSO penalty was the smallest tested value (`λ = 1e-4`), so the final predictive model kept all 22 predictors. The fitted path still shows what would happen under stronger penalization: as `λ` increases, coefficients are gradually shrunk and eventually set to zero.
 
 ```{r}
-ggplot(sparsity_path, aes(x = log_lambda)) +
-  geom_line(aes(y = test_rmse, color = "Test RMSE"), linewidth = 0.9) +
-  geom_line(aes(y = cv_rmse,   color = "CV RMSE"),   linewidth = 0.9, lty = 2) +
-  geom_vline(xintercept = log10(best_lasso$penalty),
-             color = "tomato", lty = 2) +
-  scale_color_manual(values = c("Test RMSE" = "steelblue", "CV RMSE" = "#27AE60")) +
-  labs(
-    title    = "LASSO — RMSE vs. log₁₀(λ)  (extended grid)",
-    subtitle = "Red dashed line = original CV-optimal λ",
-    x        = "log₁₀(λ)",
-    y        = "RMSE (MPG)",
-    color    = NULL
-  ) +
-  theme_minimal()
+path_summary <- tibble(
+  lambda     = lasso_glmnet$lambda,
+  log_lambda = log10(lambda),
+  n_selected = lasso_glmnet$df
+) %>%
+  slice(c(1, round(n() / 2), n())) %>%
+  mutate(lambda = round(lambda, 5),
+         log_lambda = round(log_lambda, 3))
 
-ggplot(sparsity_path, aes(x = n_selected, y = test_rmse)) +
-  geom_line(color = "steelblue", linewidth = 0.9) +
-  geom_point(color = "steelblue", size = 2) +
-  labs(
-    title    = "LASSO — test RMSE vs. number of selected features",
-    subtitle = "Each point is one λ on the extended grid",
-    x        = "Number of non-zero coefficients",
-    y        = "Test RMSE (MPG)"
-  ) +
-  theme_minimal()
+cat("=== LASSO path: representative sparsity levels ===\n")
+print(path_summary)
 ```
 
-```{r}
-n_total <- sparsity_path$n_selected[which.min(sparsity_path$log_lambda)]
-
-representative <- sparsity_path %>%
-  arrange(log_lambda) %>%
-  filter(
-    penalty == best_lasso$penalty |
-      n_selected == n_total |
-      n_selected <= 1 |
-      abs(n_selected - round(n_total / 2)) ==
-        min(abs(n_selected - round(n_total / 2))) |
-      abs(n_selected - 10) == min(abs(n_selected - 10))
-  ) %>%
-  distinct(n_selected, .keep_all = TRUE) %>%
-  arrange(desc(n_selected)) %>%
-  mutate(across(c(cv_rmse, test_rmse, penalty), ~round(., 5)))
-
-cat("=== Representative sparsity levels — what does shrinkage cost? ===\n")
-print(representative %>%
-        select(penalty, log_lambda, n_selected, cv_rmse, test_rmse))
-```
-
-The plot shows where the elbow lies: down to a moderate number of features the test RMSE barely moves, then rises sharply once λ becomes large enough to zero out genuinely informative predictors. This is the answer the original narrow-grid Scenario 3 could not give — embedded selection on this data could discard a meaningful fraction of features at almost no cost in accuracy, until it crosses the threshold where the engine-size signal itself starts being shrunk.
+This shows that LASSO is would be able of feature selection, but the cross-validated prediction model did not need sparsity. Stronger penalties would simplify the model, but they would also move it away from the penalty value selected for best predictions.
 
 ------------------------------------------------------------------------
 
@@ -2171,7 +2025,7 @@ Scenario 2 used LASSO and Elastic Net as prediction models. Scenario 3 looks at 
 
 Forward stepwise selection is an algorithmic wrapper method. It repeatedly fits candidate models and adds the predictor that improves AIC the most. This produces a clear sequence of decisions and standard regression output, including p-values for the selected variables. In our case it retained 21 of the 22 available predictors and removed only `VClass_Two.Seaters`, so the algorithmic method mostly confirmed that the preprocessing step had already removed the weakest information.
 
-LASSO and Elastic Net are embedded methods - feature selection happens inside the model fitting process through the penalty term. At the CV-optimal penalty both retained all 22 predictors, meaning that the best predictive model did not benefit from removing variables. When the penalty was increased in the extended grid, predictors started to drop out, but test RMSE rose only slowly at first and then sharply once too much engine-size signal was removed.
+LASSO and Elastic Net are embedded methods - feature selection happens inside the model fitting process through the penalty term. At the CV-optimal penalty both retained all 22 predictors, meaning that the best predictive model did not benefit from removing variables. The regularization path still shows that under stronger penalization predictors would gradually drop out, but that would move the model away from the penalty value selected for best predictive performance.
 
 Overall, the results are quite consistent across methods, with the algorithmic method producing better results. The most important predictors, such as `displ`, `cylinders`, `drive_Front.Wheel.Drive`, `fuel_group_Gasoline`, `year` and `has_discrete_gears` appear in all models and have a stable influence on the prediction. On the other hand, weaker variables, such as some manufacturer or vehicle class dummies, do not contribute much and are the first to be removed or shrink when the model is simplified.
 
@@ -2409,36 +2263,25 @@ Overall, the model performs adequately for typical vehicles but loses precision 
 
 ### Partial Least Squares (PLS)
 
-PLS (Partial Least Squares) is a supervised dimensionality reduction method for regression. It finds latent components — like PCA axes, but guided by the target — that maximally **correlate with `comb08`**, not just capture variance in X. We reuse the same preprocessed data as Scenario 2, so the comparison is direct: same features, same split, different method.
+PLS (Partial Least Squares) is a supervised dimensionality reduction method for regression. It finds latent components — like PCA axes, but guided by the target — that maximally **correlate with `comb08`**.
 
-#### 5.1 Fitting PLS with Cross-Validation
+#### Cross-Validation
 
-We fit PLS with up to 15 components and use built-in 5-fold CV to find the optimal number of components. `scale = FALSE` because `train_processed` is already normalized by `step_normalize()` in the Scenario 2 recipe.
-
+We fit PLS with up to 15 components and use 5-fold CV to find the optimal number of components. The optimal number of components is selected using a simple rule: we choose the smallest number of components whose RMSE from cross-validation is within 1% of the best observed RMSE.
 ```{r}
 pls_model <- plsr(
-  comb08 ~ .,
-  data       = train_processed,
-  ncomp      = 15,
-  validation = "CV",
-  segments   = 5,     # 5-fold CV, matching Scenario 2
-  scale      = FALSE  # already step_normalize()'d in recipe
-)
+    comb08 ~ .,
+    data       = train_processed,
+    ncomp      = 15,
+    validation = "CV",
+    segments   = 5,
+    scale      = FALSE
+  )
 
-# CV RMSEP per ncomp — index 1 = 0-component (intercept-only) model
 rmsep_cv <- RMSEP(pls_model)$val["CV", 1, ]
 
-# Elbow selection: fewest components whose RMSEP is within 1% of the global minimum.
-# which.min() would pick the global minimum (often an overfit plateau); this
-# approach favours parsimony while still being close to optimal.
 min_rmsep <- min(rmsep_cv)
 opt_ncomp <- which(rmsep_cv <= min_rmsep * 1.01)[1] - 1
-
-cat("=== PLS — CV RMSEP by number of components ===\n")
-for (k in 0:min(10, length(rmsep_cv) - 1)) {
-  marker <- if (k == opt_ncomp) "  <-- selected" else ""
-  cat(sprintf("  ncomp = %2d  |  CV RMSEP = %.4f%s\n", k, rmsep_cv[k + 1], marker))
-}
 cat("\nOptimal number of components:", opt_ncomp, "\n")
 ```
 
@@ -2450,33 +2293,40 @@ plot(RMSEP(pls_model),
 abline(v = opt_ncomp, col = "tomato", lty = 2)
 ```
 
-The elbow shows where adding more components stops improving CV accuracy. Components past the elbow add complexity without reducing error.
+Components past the "elbow" add complexity without reducing error.
 
-#### 5.2 Explained Variance per Component
 
-PLS components are ordered by how much covariance with `comb08` they capture. `explvar()` gives variance explained in X; `R2()` gives R² for y — the more important metric for a regression task.
+#### Explained Variance per Component
+
+PLS components are ordered by how much covariance with `comb08` they capture.
 
 ```{r}
-x_var <- explvar(pls_model)
-y_r2  <- R2(pls_model, estimate = "CV")$val["CV", 1, -1]  # drop intercept (index 1)
+predictor_variance_by_component <- explvar(pls_model)
+cv_rsq_by_component <- R2(pls_model, estimate = "CV")$val["CV", 1, -1]
 
 cat("=== PLS — Explained variance per component ===\n")
-# x_var is incremental (% of X variance added by each component) — cumulate it.
-# y_r2 from R2() is already cumulative (R² when using k components total) — display directly.
 cat(sprintf("%-6s  %9s  %10s  %12s\n",
     "Comp", "X var %", "Cum X %", "R²(y) CV"))
-cumx <- 0
-for (k in seq_len(min(opt_ncomp + 3, length(x_var)))) {
-  cumx   <- cumx + x_var[k]
-  marker <- if (k == opt_ncomp) "  <--" else ""
+
+cumulative_predictor_variance <- 0
+
+for (component in seq_len(min(opt_ncomp + 3, length(predictor_variance_by_component)))) {
+  cumulative_predictor_variance <- cumulative_predictor_variance +
+    predictor_variance_by_component[component]
+  selected_marker <- if (component == opt_ncomp) "  <--" else ""
+
   cat(sprintf("%-6d  %9.2f  %10.2f  %12.4f%s\n",
-      k, x_var[k], cumx, y_r2[k], marker))
+      component,
+      predictor_variance_by_component[component],
+      cumulative_predictor_variance,
+      cv_rsq_by_component[component],
+      selected_marker))
 }
 ```
 
-Comp1 captures the dominant engine-size axis, mainly contrasting larger combustion engines with more efficient drivetrain and gearing patterns. Subsequent components pick up smaller, residual patterns.
+Comp1 captures the dominant engine-size axis, mainly showing the difference between larger combustion engines with more efficient drivetrain and gearing patterns. Subsequent components pick up smaller, residual patterns.
 
-#### 5.3 Dimensionality Reduction — Projection onto First Two Components
+#### Dimensionality Reduction — Projection onto First Two Components
 
 We project all training vehicles onto Comp1 and Comp2. This is the dimensionality reduction result: 22 normalized predictors collapse into 2 coordinates. Color shows actual MPG — a clean gradient confirms Comp1 captures the efficiency axis.
 
@@ -2495,17 +2345,17 @@ ggplot(scores_df, aes(x = Comp1, y = Comp2, color = comb08)) +
   geom_point(alpha = 0.3, size = 0.6) +
   scale_color_viridis_c(option = "plasma", name = "MPG") +
   labs(
-    title    = "PLS — projection of training data onto first two components",
-    subtitle = "Color = actual combined MPG (purple = low, yellow = high)",
+    title    = "PLS — training data on first two components",
+    subtitle = "Color = combined MPG (purple = low, yellow = high)",
     x        = "PLS Component 1",
     y        = "PLS Component 2"
   ) +
   theme_minimal()
 ```
 
-#### 5.4 Component Loadings
+#### Component Loadings
 
-Loadings show which predictors drive Comp1. Negative loadings push toward lower MPG; positive loadings push toward higher MPG.
+Loadings show which predictors drive Comp1.
 
 ```{r fig.height=6}
 loadings_df <- as_tibble(loadings(pls_model)[, 1, drop = FALSE],
@@ -2525,17 +2375,11 @@ loadings_df %>%
     y        = "Comp1 loading"
   ) +
   theme_minimal()
-
-cat("=== PLS — Top 5 predictors for Comp1 (absolute loading) ===\n")
-loadings_df %>%
-  slice_max(abs(Comp1), n = 5) %>%
-  mutate(Comp1 = round(Comp1, 4)) %>%
-  print()
 ```
 
-#### 5.5 Test Set Evaluation
+#### Test Set Evaluation
 
-We predict on the held-out test set using `opt_ncomp` components and compare directly with the four Scenario 2 models — same test set, same metrics.
+We predict on the test set using `opt_ncomp` components and compare directly with the four Scenario 2 models — same test set, same metrics.
 
 ```{r}
 pls_pred <- predict(pls_model, newdata = test_processed, ncomp = opt_ncomp)[, , 1]
@@ -2577,6 +2421,12 @@ ggplot(pls_metrics, aes(x = truth, y = pred)) +
   ) +
   theme_minimal()
 ```
+
+The PLS model selected 3 components using the "elbow" rule. These 3 components explain only 22.91% of the predictor variance, but already reach a cross-validated R² of 0.6703, which shows that PLS focuses on the part of the feature space that is most relevant for predicting `comb08`, not necessarily on explaining all predictor variance.
+
+On the test set, PLS achieved RMSE = 3.3005, MAE = 2.1785 and R² = 0.6737. This is very close to the parametric models from Scenario 2, but slightly worse than the full linear regression, LASSO and Elastic Net. The top loadings of the first component are `displ`, `cylinders`, `drive_Front.Wheel.Drive`, `drive_Rear.Wheel.Drive` and `has_discrete_gears`, which confirms that the main PLS component captures the same engine-size and drivetrain structure identified throughout the analysis.
+ 
+Overall, PLS provides an interpretable regression model, reducing 22 predictors to 3 supervised components with only a small loss in performance. However, it does not outperform the original feature-space models.
 
 ------------------------------------------------------------------------
 
