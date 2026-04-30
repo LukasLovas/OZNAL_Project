@@ -7,8 +7,6 @@ output: html_document
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE)
-setwd("D:/Škola/Ing/2.semester/OZNAL_projekt")
-#setwd("C:/school/oznal/OZNAL_Project")
 ```
 
 # Introduction
@@ -32,6 +30,9 @@ Based on the column descriptions, we could potentially predict fuel consumption 
 -   **Target variable:** `comb08`
 
 ```{r}
+install.packages(c("MASS", "tidyverse", "ggcorrplot", "patchwork", "rsample", "recipes",
+                     "stringr", "forcats", "tidymodels", "broom", "glmnet", "pls", "leaps",
+                     "rpart", "ranger", "kknn", "vip", "parsnip", "factoextra"))
 library(MASS)
 library(tidyverse)
 library(ggcorrplot)
@@ -55,7 +56,6 @@ library(factoextra)
 rm(list = ls())
 data <- read_csv("data/vehicles.csv")
 data
-View(data)
 ```
 
 ## Basic Structure
@@ -671,15 +671,17 @@ print(folds)
 
 We define preprocessing as a `recipe` to prevent data leakage — all transformations (normalization, imputation, dummy encoding) are learned only from the training data and then applied to the test set using those saved values. This also works correctly inside cross-validation, where each fold fits its own preprocessing independently.
 
--   `step_unknown()` — handles unseen factor levels that may appear in the test set
+-   `step_novel()` — handles new factor levels that may appear in validation or test data
+-   `step_unknown()` — handles missing values in nominal predictors
 -   `step_other()` — collapses any residual rare categories below 1%
 -   `step_impute_median(displ, cylinders)` — fills the small number of numeric NAs in engine parameters for non-BEV rows; `n_gears` is intentionally set to 0 in feature engineering and does not need imputation
 -   `step_dummy()` — one-hot encodes all nominal predictors; required by linear regression methods
 -   `step_zv()` / `step_nzv()` — removes zero- and near-zero-variance columns, consistent with EDA findings on low-variability variables
--   `step_normalize()` — standardizes all numeric predictors; required for ridge, lasso, elastic net, kNN, and PCA/PCR/PLS
+-   `step_normalize()` — standardizes all numeric predictors; required for ridge, lasso, elastic net, kNN, PCA, and PLS
 
 ```{r}
 model_recipe <- recipe(comb08 ~ ., data = train_data) %>%
+  step_novel(all_nominal_predictors()) %>%
   step_unknown(all_nominal_predictors()) %>%
   step_other(all_nominal_predictors(), threshold = 0.01) %>%
   step_impute_median(displ, cylinders) %>%
@@ -1155,15 +1157,15 @@ On large datasets the differences are small. Regularization stabilizes coefficie
 
 ##### Effect of removing electric vehicles
 
-Removing 1 425 BEVs (whose `comb08` values are MPGe, not MPG) dropped RMSE from 8.11 to **3.36 MPG** (−59%) and MAE from 5.15 to **2.19 MPG**. R² only moved from 0.642 to 0.661 — this is expected, since R² is scale-independent and both the errors and the total variance dropped together.
+Removing 1 425 BEVs (whose `comb08` values are MPGe, not MPG) gives the linear models a cleaner MPG-only target. In the current run, the OLS baseline achieves **RMSE = 3.28 MPG, MAE = 2.16 MPG and R² = 0.677** on the test set.
 
 ##### Model results
 
-All four models gave nearly the same result on the test set: **RMSE ≈ 3.36 MPG, MAE ≈ 2.19 MPG, R² ≈ 0.661**. With a median `comb08` of 20 MPG, an average error of 2.19 MPG is roughly 11% — reasonable for a linear model with 21 features.
+All four models gave nearly the same result on the test set: **RMSE ≈ 3.28 MPG, MAE ≈ 2.16 MPG, R² ≈ 0.677**. With a median `comb08` of 20 MPG, an average error of 2.16 MPG is roughly 11% — reasonable for a linear model with 22 features.
 
 ##### Why regularization did not help
 
-All three regularized models selected `penalty = 0.0001` — the minimum of the search grid. With 38 735 training observations and only 21 predictors, there is very little variance to reduce, so regularization has almost nothing to do. LASSO also kept all 21 predictors for the same reason — at such a small penalty, no predictor is weak enough to be zeroed out. This is not a bad result; it means the feature set is clean and every variable carries real signal.
+All three regularized models selected `penalty = 0.0001` — the minimum of the search grid. With 38 735 training observations and only 22 predictors, there is very little variance to reduce, so regularization has almost nothing to do. LASSO also kept all 22 predictors for the same reason — at such a small penalty, no predictor is weak enough to be zeroed out. This is not a bad result; it means the feature set is clean and every variable carries real signal.
 
 ##### Where the models fall short
 
@@ -1173,16 +1175,29 @@ All three regularized models selected `penalty = 0.0001` — the minimum of the 
 
 The CV–test gap is below 0.005 for all models, so there is no overfitting. The models are a solid baseline — interpretable, stable, and easy to explain.
 
-#### 2.5 Extension: interaction terms (cylinders × displ)
+#### 2.5 Extension: interaction terms
 
-The four parametric models above are linear in the predictors. EDA showed that `cylinders` and `displ` are strongly correlated (r ≈ 0.91) and that adding a cylinder affects small engines differently than V8s — a classic non-linearity that a purely linear model cannot capture. Here we add the explicit product term `cylinders × displ` to the recipe and refit OLS to see whether the cross-effect reduces test RMSE and what its sign tells us.
+The four parametric models above are linear in the predictors. Since Ridge, LASSO and Elastic Net did not improve meaningfully over the OLS baseline, we extend OLS with four interpretable interaction terms. These interactions test whether engine-size effects depend on engine architecture, vehicle age and transmission structure.
+
+The interaction terms were chosen from domain logic rather than by testing every possible combination:
+
+- `cylinders:displ` checks whether the MPG effect of engine displacement changes with engine architecture. A 3.0L engine with fewer cylinders may behave differently from a 3.0L engine with more cylinders.
+- `displ:year` checks whether the effect of engine size changed over time, because newer engines can use better combustion, turbocharging and efficiency technology.
+- `cylinders:year` checks whether the MPG penalty of additional cylinders differs across vehicle generations.
+- `displ:has_discrete_gears` checks whether the effect of engine size depends on transmission structure. Vehicles with discrete gears may use engine displacement differently than CVT or other non-discrete transmissions.
 
 ```{r}
 rec_interact <- recipe(comb08 ~ ., data = train_data) %>%
+  step_novel(all_nominal_predictors()) %>%
   step_unknown(all_nominal_predictors()) %>%
   step_other(all_nominal_predictors(), threshold = 0.01) %>%
   step_impute_median(displ, cylinders) %>%
-  step_interact(terms = ~ cylinders:displ) %>%
+  step_interact(terms = ~
+    cylinders:displ +
+    displ:year +
+    cylinders:year +
+    displ:has_discrete_gears
+  ) %>%
   step_dummy(all_nominal_predictors()) %>%
   step_zv(all_predictors()) %>%
   step_nzv(all_predictors()) %>%
@@ -1200,7 +1215,7 @@ ols_interact_pred <- predict(ols_interact_fit, new_data = test_data) %>%
   bind_cols(test_data %>% select(comb08))
 
 ols_interact_metrics <- tibble(
-  model = "OLS (cylinders × displ)",
+  model = "OLS (4 interactions)",
   RMSE  = rmse_vec(truth = ols_interact_pred$comb08,
                    estimate = ols_interact_pred$.pred),
   MAE   = mae_vec( truth = ols_interact_pred$comb08,
@@ -1213,23 +1228,23 @@ ols_interact_metrics <- tibble(
 interaction_compare <- bind_rows(
   test_comparison %>% filter(model == "Linear Regression") %>%
     select(model, RMSE, MAE, Rsq) %>%
-    mutate(model = "OLS (no interaction)"),
+    mutate(model = "OLS (no interactions)"),
   ols_interact_metrics
 )
 
-cat("=== OLS with vs. without cylinders × displ ===\n")
+cat("=== OLS with vs. without 4 interaction terms ===\n")
 print(interaction_compare)
 
-interaction_term <- ols_interact_fit %>%
+interaction_terms <- ols_interact_fit %>%
   extract_fit_parsnip() %>%
   tidy() %>%
-  filter(grepl("cylinders_x_displ|cylinders:displ", term))
+  filter(grepl("cylinders_x_displ|displ_x_year|cylinders_x_year|displ_x_has_discrete_gears", term))
 
-cat("\n=== Interaction coefficient ===\n")
-print(interaction_term)
+cat("\n=== Interaction coefficients ===\n")
+print(interaction_terms)
 ```
 
-The sign of the `cylinders × displ` coefficient indicates how the cylinder effect changes per unit of normalized displacement: a negative value means adding a cylinder hurts MPG more on top of an already-large engine (compounding penalty); a positive value means the cylinder penalty softens for big engines. The RMSE gain is expected to be small at n/p \> 2000, but the interaction coefficient itself directly tests whether the cross-effect we suspected from EDA is real after controlling for everything else in the model.
+The four interaction terms test whether the effect of engine displacement and cylinder count changes across vehicle age and transmission structure. If these terms reduce test RMSE without increasing the train-test gap substantially, they indicate that the linear baseline was missing simple non-additive relationships.
 
 ### Non-parametric regression methods
 
@@ -1606,6 +1621,14 @@ ggplot(knn_pred, aes(x = .pred, y = residual)) +
 
 The actual vs. predicted plot as well as the residuals plot is very similar to random forests plots. The model has strong predictive performance for standard vehicles, however it tends to underestimate more efficient vehicles with higher MPG.
 
+### Scenario 2 comparison: Parametric vs. non-parametric models
+
+The parametric models provide a stable and interpretable baseline. OLS, Ridge, LASSO and Elastic Net all achieved very similar performance, with test RMSE around 3.28 MPG. Regularization did not improve prediction because the dataset has many observations relative to the number of predictors and the manually engineered feature set is already clean. The interaction-extended OLS improved the linear baseline to RMSE around 3.13, showing that some important relationships are not purely additive.
+
+The non-parametric models performed substantially better. Decision tree, Random Forest and KNN can capture threshold effects, local patterns and non-linear relationships between engine size, drivetrain, year and MPG. KNN achieved the strongest test performance among the tested models, while Random Forest offered a better balance between accuracy, robustness and feature importance interpretation. The improvement over parametric models confirms that fuel efficiency is not fully explained by a simple linear relationship.
+
+The trade-off is interpretability. Parametric models are easier to explain because each coefficient has a direct meaning. Non-parametric models are more accurate, but their internal decision structure is harder to communicate. For deployment in the Shiny app, it therefore makes sense to show both: the interaction OLS as an interpretable baseline and the non-parametric models as the strongest predictive alternatives.
+
 ## Scenario 3: Feature Selection
 
 We have already removed redundant, leaking and uninformative features during preprocessing. Feature selection extends the analysis by determining which of the remaining 22 features truly contribute to predicting the target variable and which can be removed without a significant decrease in performance. We compare one algorithmic method (forward selection) and two embedded methods (LASSO and Elastic Net), then evaluate how many features each retains and whether the reduced feature set preserves predictive performance compared to models trained in previous tasks.
@@ -1707,7 +1730,7 @@ bind_rows(forward_train_metrics, forward_test_metrics) %>%
   pivot_wider(names_from = split, values_from = .estimate)
 ```
 
-On the test set the model achieved RMSE = 3.28, MAE = 2.16, and R² = 0.678. Comparing train and test metrics shows practically no difference, indicating that the model generalizes well with no signs of overfitting. However, compared to the random forest model (RMSE = 2.56, R² = 0.964), the linear forward selection model is considerably weaker, suggesting that the relationship between predictors and fuel efficiency contains substantial non-linear structure that a linear model cannot capture.
+On the test set the model achieved RMSE = 3.28, MAE = 2.16, and R² = 0.677. Comparing train and test metrics shows practically no difference, indicating that the model generalizes well with no signs of overfitting. However, compared to the random forest model (RMSE = 2.56, R² = 0.964), the linear forward selection model is considerably weaker, suggesting that the relationship between predictors and fuel efficiency contains substantial non-linear structure that a linear model cannot capture.
 
 ```{r}
 tibble(actual = test_processed$comb08,
@@ -1757,7 +1780,7 @@ The third graph illustrates the decrease of AIC during forward selection. A shar
 
 #### Summary
 
-Forward stepwise selection identified 21 statistically significant predictors of `comb08` out of all available candidates. The most influential variables added in the early steps were `displ`, `year`, `drive_Front.Wheel.Drive`, and `fuel_group_Gasoline`, which together account for the largest share of explained variance. The final model achieved R² = 0.678 and RMSE = 3.28 on the test set, with no signs of overfitting as train and test metrics were nearly identical. Compared to the non-parametric models trained earlier, forward selection performs considerably worse - Random Forest achieved RMSE = 2.56 and R² = 0.964 on the same data. This gap highlights the limitation of linear feature selection methods when the underlying relationships are non-linear. However, forward selection offers a clear advantage in interpretability, because each coefficient has a direct meaning and statistical significance can be assessed for every predictor, which is not possible with Random Forest or KNN.
+Forward stepwise selection identified 21 statistically significant predictors of `comb08` out of all available candidates. The most influential variables added in the early steps were `displ`, `year`, `drive_Front.Wheel.Drive`, and `fuel_group_Gasoline`, which together account for the largest share of explained variance. The final model achieved R² = 0.677 and RMSE = 3.28 on the test set, with no signs of overfitting as train and test metrics were nearly identical. Compared to the non-parametric models trained earlier, forward selection performs considerably worse - Random Forest achieved RMSE = 2.56 and R² = 0.964 on the same data. This gap highlights the limitation of linear feature selection methods when the underlying relationships are non-linear. However, forward selection offers a clear advantage in interpretability, because each coefficient has a direct meaning and statistical significance can be assessed for every predictor, which is not possible with Random Forest or KNN.
 
 ### Embedded methods
 
@@ -1787,7 +1810,7 @@ model_classification <- tibble(
 cat("=== Scenario 2 models — embedded method classification ===\n")
 print(model_classification)
 cat("\nSelected for Scenario 3: LASSO and Elastic Net\n")
-cat("(best-performing embedded-eligible models from Scenario 2 — test RMSE ≈ 3.36 MPG)\n")
+cat("(best-performing embedded-eligible models from Scenario 2 — test RMSE ≈ 3.28 MPG)\n")
 ```
 
 #### 3.2 LASSO — Regularization Path
@@ -2169,11 +2192,11 @@ Scenario 2 used LASSO and Elastic Net as prediction models. Scenario 3 looks at 
 
 #### Regularization path insight
 
-The CV-optimal λ sits near the far-left end of both paths — close to zero, meaning almost no features are removed. This is consistent with Scenario 2's finding: with 38 735 training observations and only \~60 dummy-encoded predictors, there is very little variance to reduce. Every predictor carries enough signal that the cross-validation penalty is not large enough to zero it out. The path still demonstrates the embedded selection mechanism: at higher λ values, features do drop out in order of their contribution — the path just happens to stop before that region is reached.
+The CV-optimal λ sits near the far-left end of both paths — close to zero, meaning almost no features are removed. This is consistent with Scenario 2's finding: with 38 735 training observations and only 22 predictors after preprocessing, there is very little variance to reduce. Every predictor carries enough signal that the cross-validation penalty is not large enough to zero it out. The path still demonstrates the embedded selection mechanism: at higher λ values, features do drop out in order of their contribution — the path just happens to stop before that region is reached.
 
 #### Which features were consistently selected
 
-Features retained by both LASSO and Elastic Net at the CV-optimal λ are the most robustly embedded-selected predictors. The strongest predictors — `displ`, `cylinders`, `fuel_group_Electricity`, `drive` variants — appear with large coefficients in both models. Where the models differ slightly in coefficient magnitudes, the L2 component of Elastic Net distributes weight more evenly among correlated features (particularly `displ` and `cylinders` with r ≈ 0.91 in the EDA).
+Features retained by both LASSO and Elastic Net at the CV-optimal λ are the most robustly embedded-selected predictors. The strongest predictors — `displ`, `cylinders`, `fuel_group_Gasoline`, `year`, `has_discrete_gears` and `drive` variants — appear with large coefficients in both models. Where the models differ slightly in coefficient magnitudes, the L2 component of Elastic Net distributes weight more evenly among correlated features (particularly `displ` and `cylinders` with r ≈ 0.91 in the EDA).
 
 #### Performance vs. number of features
 
@@ -2182,6 +2205,14 @@ Both embedded models produce identical or near-identical RMSE to OLS with all fe
 #### Suitability
 
 LASSO is the simpler embedded selector — clean, interpretable, sparse when the data supports it. Elastic Net is a better fit for this dataset because several predictors are correlated (`displ`/`cylinders`, multiple `drive` dummies) — the L2 component stabilizes their joint selection. The CV-tuned mixture value shows how much L2 the data preferred. The same fundamental limitations apply as in Scenario 2: non-linear engine-size effects, PHEV driving-mode behavior, and missing weight/drag features are not addressable by changing the regularization strategy.
+
+#### Algorithmic vs. embedded selection
+
+Forward stepwise selection is an algorithmic wrapper method: it repeatedly fits candidate models and adds the predictor that improves AIC the most. This produces a clear sequence of decisions and standard regression output, including p-values for the selected variables. In our case it retained 21 of the 22 available predictors and removed only `VClass_Two.Seaters`, so the algorithmic method mostly confirmed that the preprocessing step had already removed the weakest information.
+
+LASSO and Elastic Net are embedded methods: feature selection happens inside the model fitting process through the penalty term. At the CV-optimal penalty both retained all 22 predictors, meaning that the best predictive model did not benefit from removing variables. When the penalty was increased in the extended grid, predictors started to drop out, but test RMSE rose only slowly at first and then sharply once too much engine-size signal was removed.
+
+Statistical significance should be interpreted differently across these methods. Forward selection is an OLS model, so it gives p-values and lets us discuss which selected predictors remain statistically significant after other variables enter the model. Embedded methods based on `glmnet` do not provide classical p-values; instead, their equivalent evidence is coefficient stability along the regularization path. Features with large and stable coefficients, such as `displ`, `cylinders`, `drive_Front.Wheel.Drive`, `fuel_group_Gasoline`, `year` and `has_discrete_gears`, remain important across methods. Weak manufacturer or class dummy variables are less stable and are the first candidates to lose practical importance when the model is simplified.
 
 ------------------------------------------------------------------------
 
@@ -2482,11 +2513,11 @@ for (k in seq_len(min(opt_ncomp + 3, length(x_var)))) {
 }
 ```
 
-Comp1 captures the dominant engine-size axis — the same linear combination that drove LD1 in LDA. Subsequent components pick up smaller, residual patterns.
+Comp1 captures the dominant engine-size axis, mainly contrasting larger combustion engines with more efficient drivetrain and gearing patterns. Subsequent components pick up smaller, residual patterns.
 
 #### 5.3 Dimensionality Reduction — Projection onto First Two Components
 
-We project all training vehicles onto Comp1 and Comp2. This is the dimensionality reduction result: \~60 normalized features collapse into 2 coordinates. Color shows actual MPG — a clean gradient confirms Comp1 captures the efficiency axis.
+We project all training vehicles onto Comp1 and Comp2. This is the dimensionality reduction result: 22 normalized predictors collapse into 2 coordinates. Color shows actual MPG — a clean gradient confirms Comp1 captures the efficiency axis.
 
 ```{r}
 scores_df <- tibble(
@@ -2586,112 +2617,47 @@ ggplot(pls_metrics, aes(x = truth, y = pred)) +
   theme_minimal()
 ```
 
-#### 5.6 Extension: PCR (unsupervised components + OLS)
-
-PLS chooses components that maximize covariance with `comb08` — a *supervised* projection. PCA chooses components that maximize variance of the predictors alone, ignoring the target — *unsupervised*. PCR is OLS fitted on the top-k PCA components. Comparing PLS at its optimal k = 3 with PCR at the same k tells us whether the supervision actually helped on this dataset, or whether the data's principal axes already happen to align with MPG.
-
-```{r warning=FALSE}
-fit_pcr_k <- function(k) {
-  rec_pcr_k <- recipe(comb08 ~ ., data = train_data) %>%
-    step_unknown(all_nominal_predictors()) %>%
-    step_other(all_nominal_predictors(), threshold = 0.01) %>%
-    step_impute_median(displ, cylinders) %>%
-    step_dummy(all_nominal_predictors()) %>%
-    step_zv(all_predictors()) %>%
-    step_nzv(all_predictors()) %>%
-    step_normalize(all_numeric_predictors()) %>%
-    step_pca(all_numeric_predictors(), num_comp = k)
-
-  pcr_wf_k <- workflow() %>%
-    add_recipe(rec_pcr_k) %>%
-    add_model(linear_reg() %>% set_engine("lm"))
-
-  fit_k  <- pcr_wf_k %>% fit(train_data)
-  pred_k <- predict(fit_k, new_data = test_data) %>%
-    bind_cols(test_data %>% select(comb08))
-
-  tibble(
-    k    = k,
-    RMSE = rmse_vec(truth = pred_k$comb08, estimate = pred_k$.pred),
-    MAE  = mae_vec( truth = pred_k$comb08, estimate = pred_k$.pred),
-    Rsq  = rsq_vec( truth = pred_k$comb08, estimate = pred_k$.pred)
-  )
-}
-
-pcr_results <- map_dfr(1:15, fit_pcr_k)
-
-cat("=== PCR — test RMSE per number of components ===\n")
-print(pcr_results %>% mutate(across(c(RMSE, MAE, Rsq), ~round(., 4))))
-```
-
-```{r}
-pls_per_k <- tibble(
-  k    = 1:15,
-  RMSE = sapply(1:15, function(k) {
-    p <- predict(pls_model, newdata = test_processed, ncomp = k)[, , 1]
-    rmse_vec(truth = test_processed$comb08, estimate = as.numeric(p))
-  })
-)
-
-ggplot() +
-  geom_line(data = pcr_results, aes(x = k, y = RMSE, color = "PCR (PCA + OLS)"),
-            linewidth = 0.9) +
-  geom_point(data = pcr_results, aes(x = k, y = RMSE, color = "PCR (PCA + OLS)"),
-             size = 2) +
-  geom_line(data = pls_per_k, aes(x = k, y = RMSE, color = "PLS"),
-            linewidth = 0.9) +
-  geom_point(data = pls_per_k, aes(x = k, y = RMSE, color = "PLS"),
-             size = 2) +
-  geom_vline(xintercept = 3, color = "tomato", lty = 2) +
-  scale_color_manual(values = c("PCR (PCA + OLS)" = "#27AE60", "PLS" = "steelblue")) +
-  labs(
-    title    = "PLS vs. PCR — test RMSE by number of components",
-    subtitle = "Red dashed line = k = 3 (PLS elbow)",
-    x        = "Number of components",
-    y        = "Test RMSE",
-    color    = "Method"
-  ) +
-  theme_minimal()
-```
-
-```{r}
-pcr_k3 <- pcr_results %>% filter(k == 3)
-pcr_k15 <- pcr_results %>% filter(k == 15)
-
-pls_pcr_table <- tibble(
-  model        = c("PLS", "PCR", "PCR", "OLS (full)"),
-  n_components = c("3", "3", "15", "≈ 60 (all features)"),
-  RMSE         = c(round(pls_rmse, 4),
-                   round(pcr_k3$RMSE, 4),
-                   round(pcr_k15$RMSE, 4),
-                   test_comparison %>% filter(model == "Linear Regression") %>% pull(RMSE)),
-  Rsq          = c(round(pls_rsq, 4),
-                   round(pcr_k3$Rsq, 4),
-                   round(pcr_k15$Rsq, 4),
-                   test_comparison %>% filter(model == "Linear Regression") %>% pull(Rsq))
-)
-
-cat("=== PLS vs. PCR vs. OLS — test set comparison ===\n")
-print(pls_pcr_table)
-```
-
-If PCR at k = 3 matches PLS at k = 3, the dataset's principal axes of variance already point in the direction of `comb08` — supervision adds nothing because the unsupervised projection happens to be aimed correctly. If PCR is meaningfully worse at k = 3 but catches up by k = 15, supervision genuinely helped: PLS finds the MPG-relevant direction faster than PCA does.
-
 ------------------------------------------------------------------------
 
 #### Conclusion
 
+PCA and PLS both reduce the dimensionality of the feature space, but they optimize different goals. PCA is unsupervised: it keeps directions with the largest variance in the predictors, regardless of whether that variance helps predict `comb08`. PLS is supervised: it builds components that explain covariance with the target, so its components are more directly aligned with the regression task.
 
+The PCA-based model used Random Forest after the PCA transformation. It achieved strong performance, but still performed worse than Random Forest trained on the original feature space. This suggests that PCA removed some fine-grained predictive information. PCA also reduces explainability because the model no longer uses original variables directly; instead, it works with principal components that mix many predictors together. We can discuss variance retained, but it becomes harder to say how a specific original feature affects MPG.
 
+PLS compressed the model to 3 supervised components and achieved test RMSE around 3.30, close to the linear Scenario 2 models but weaker than the non-parametric models. Its advantage is parsimony and interpretability of the latent structure: the loadings show that Component 1 is mainly driven by `displ`, `cylinders`, drivetrain and gearing variables, which is consistent with the rest of the analysis. The information loss is visible in the slightly worse prediction performance, but the component structure remains easier to connect back to the regression target than PCA components.
+
+Overall, PCA is useful as a general unsupervised compression technique, especially when combined with a flexible model such as Random Forest, but it sacrifices feature-level interpretation. PLS is more targeted for regression and more compact, but it behaves closer to a linear supervised model and therefore cannot match the best non-linear models. In this dataset, dimensionality reduction is not essential because we only have 22 predictors after preprocessing; it is mainly useful as an explanatory comparison rather than as the best predictive strategy.
+
+## Final Conclusion
+
+The project started with a large vehicle fuel economy dataset and transformed it into a cleaner modeling dataset focused on combustion and hybrid vehicles. We removed variables with leakage, excessive missingness, identifiers, sparse technical fields and electric-only MPGe observations. We then engineered interpretable predictors such as fuel group, drivetrain group, transmission type, number of gears and discrete-gearing indicators. The final modeling data contained 22 predictors and the target variable `comb08`.
+
+In Scenario 2, we compared parametric and non-parametric regression models. The linear parametric models were stable and interpretable, but their performance was limited by the linear form. Ridge, LASSO and Elastic Net did not improve over OLS because the dataset was large and the feature set was already compact. Adding four domain-driven interaction terms improved the OLS baseline, confirming that simple non-additive effects matter. The non-parametric models performed best overall, especially Random Forest and KNN, because they captured non-linear structure that linear models could not.
+
+In Scenario 3, we studied feature selection. Forward stepwise selection retained almost all predictors, and embedded methods also kept all features at the CV-optimal penalty. This means the preprocessing stage had already removed most uninformative variables and the remaining predictors carried meaningful signal. The embedded regularization path still showed how features would be removed under stronger penalization, but aggressive sparsity increased error once important engine-size information was lost.
+
+In Scenario 5, we compared PCA and PLS as dimensionality reduction approaches. PCA reduced the feature space but introduced information loss and weaker explainability because principal components are mixtures of original predictors. PLS used supervised components and gave a compact regression model with interpretable loadings, but its predictive performance stayed close to the linear models rather than the stronger non-parametric models. Since the final dataset is not highly dimensional, dimensionality reduction is informative but not necessary for the best prediction.
+
+Overall, the main result is clear: fuel efficiency is strongly driven by engine size, cylinder count, drivetrain, transmission structure, fuel group and vehicle year. Linear models explain these effects transparently, but non-parametric models predict better. The best practical solution is therefore to present both perspectives: interpretable fitted models for explanation and stronger non-parametric fitted models for predictive performance in the Shiny app.
 
 
 *Save trained models for display in Shiny app*
 
 ```{r}
+dir.create("models", showWarnings = FALSE)
+
+saveRDS(ols_interact_fit, "models/ols_interact_fit.rds")
+
 saveRDS(dt_final,     "models/dt_final.rds")
 saveRDS(rf_final,     "models/rf_final.rds")
 saveRDS(knn_final,    "models/knn_final.rds")
+
+saveRDS(forward_model, "models/forward_model.rds")
+saveRDS(en_fit,        "models/en_fit.rds")
+
 saveRDS(pca_rf_final, "models/pca_rf_final.rds")
+saveRDS(list(model = pls_model, ncomp = opt_ncomp), "models/pls_final.rds")
 
 saveRDS(cor_matrix, "models/cor_matrix.rds")
 ```

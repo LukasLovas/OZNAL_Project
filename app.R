@@ -10,6 +10,7 @@ library(kknn)
 library(vip)
 library(ggcorrplot)
 library(shinydashboard)
+library(pls)
 
 # ── COLUMN VALIDATION ─────────────────────────────────────────────────
 required_cols <- c(
@@ -102,7 +103,8 @@ prepare_data <- function(path) {
 }
 
 # ── LOAD & SPLIT DATA ─────────────────────────────────────────────────
-DATA_PATH <- "C:/school/oznal/OZNAL_Project/data/vehicles.csv"
+DATA_PATH <- file.path("data", "vehicles.csv")
+MODELS_DIR <- "models"
 
 vehicles_model <- prepare_data(DATA_PATH)
 
@@ -118,24 +120,60 @@ clean_recipe <- recipe(comb08 ~ ., data = train_data) %>%
   step_unknown(all_nominal_predictors()) %>%
   step_other(all_nominal_predictors(), threshold = 0.01) %>%
   step_impute_median(displ, cylinders) %>%
+  step_mutate(
+    phevBlended = as.integer(phevBlended),
+    is_cvt = as.integer(is_cvt)
+  ) %>%
   step_dummy(all_nominal_predictors()) %>%
   step_zv(all_predictors()) %>%
   step_normalize(all_numeric_predictors())
 
+processed_recipe <- prep(clean_recipe, training = train_data)
+test_processed <- bake(processed_recipe, new_data = test_data)
+
 # ── LOAD PRE-TRAINED MODELS ───────────────────────────────────────────
+model_path <- function(filename) {
+  file.path(MODELS_DIR, filename)
+}
+
 load_model_safe <- function(path) {
   if (file.exists(path)) readRDS(path) else NULL
 }
 
+model_entry <- function(filename, type = "workflow") {
+  object <- load_model_safe(model_path(filename))
+  if (is.null(object)) return(NULL)
+  list(object = object, type = type)
+}
+
+expected_model_files <- c(
+  "OLS + interaction"  = "ols_interact_fit.rds",
+  "Decision tree"      = "dt_final.rds",
+  "Random forest"      = "rf_final.rds",
+  "KNN"                = "knn_final.rds",
+  "Elastic Net"        = "en_fit.rds",
+  "Forward stepwise"   = "forward_model.rds",
+  "Random forest + PCA" = "pca_rf_final.rds",
+  "PLS"                = "pls_final.rds"
+)
+
+missing_model_files <- expected_model_files[
+  !file.exists(file.path(MODELS_DIR, expected_model_files))
+]
+
 pretrained_models <- list(
-  "Decision tree"       = load_model_safe("models/dt_final.rds"),
-  "Random forest"       = load_model_safe("models/rf_final.rds"),
-  "KNN"                 = load_model_safe("models/knn_final.rds"),
-  "Random forest + PCA" = load_model_safe("models/pca_rf_final.rds")
+  "OLS + interaction"  = model_entry(expected_model_files[["OLS + interaction"]]),
+  "Decision tree"      = model_entry(expected_model_files[["Decision tree"]]),
+  "Random forest"      = model_entry(expected_model_files[["Random forest"]]),
+  "KNN"                = model_entry(expected_model_files[["KNN"]]),
+  "Elastic Net"        = model_entry(expected_model_files[["Elastic Net"]]),
+  "Forward stepwise"   = model_entry(expected_model_files[["Forward stepwise"]], "processed_lm"),
+  "Random forest + PCA" = model_entry(expected_model_files[["Random forest + PCA"]]),
+  "PLS"                = model_entry(expected_model_files[["PLS"]], "pls")
 )
 
 pretrained_models <- Filter(Negate(is.null), pretrained_models)
-cor_matrix <- readRDS("models/cor_matrix.rds")
+cor_matrix <- load_model_safe(model_path("cor_matrix.rds"))
 
 # ── UI ────────────────────────────────────────────────────────────────
 ui <- fluidPage(
@@ -202,7 +240,8 @@ ui <- fluidPage(
                  h5("These models were trained and tuned in the project R markdown file."),
                  hr(),
                  selectInput("pretrained_model", "Select model",
-                             choices = names(pretrained_models))
+                             choices = names(pretrained_models)),
+                 uiOutput("pretrained_model_status")
                ),
                mainPanel(
                  h4("Performance metrics"),
@@ -236,15 +275,21 @@ ui <- fluidPage(
                              choices = c("Linear regression" = "lm",
                                          "Lasso"             = "lasso",
                                          "Ridge"             = "ridge",
+                                         "Elastic Net"       = "elastic_net",
                                          "Random forest"     = "rf",
                                          "Decision tree"     = "dt",
                                          "KNN"               = "knn")),
                  
-                 # Lasso / Ridge parameters
+                 # Regularized linear model parameters
                  conditionalPanel(
-                   condition = "input.model_type == 'lasso' || input.model_type == 'ridge'",
+                   condition = "input.model_type == 'lasso' || input.model_type == 'ridge' || input.model_type == 'elastic_net'",
                    sliderInput("penalty", "Penalty (lambda)",
                                min = 0.001, max = 1, value = 0.1, step = 0.001)
+                 ),
+                 conditionalPanel(
+                   condition = "input.model_type == 'elastic_net'",
+                   sliderInput("mixture", "Mixture (alpha)",
+                               min = 0, max = 1, value = 0.5, step = 0.05)
                  ),
                  
                  # Random Forest parameters
@@ -364,12 +409,61 @@ server <- function(input, output, session) {
   })
   
   # ── Pre-trained models ───────────────────────────────────────────────
+  output$pretrained_model_status <- renderUI({
+    if (length(pretrained_models) == 0) {
+      return(tags$p(
+        "No pretrained models loaded. Run the model export chunk in project.Rmd.",
+        style = "color: #B00020; font-weight: bold;"
+      ))
+    }
+    
+    if (length(missing_model_files) == 0) {
+      return(tags$p(
+        "All expected pretrained models are loaded.",
+        style = "color: #1B7F37;"
+      ))
+    }
+    
+    tags$div(
+      tags$p("Missing model files:", style = "color: #B26A00; font-weight: bold;"),
+      tags$ul(lapply(unname(missing_model_files), tags$li))
+    )
+  })
+  
+  predict_pretrained <- function(entry) {
+    if (entry$type == "processed_lm") {
+      return(tibble(
+        .pred = as.numeric(predict(entry$object, newdata = test_processed)),
+        comb08 = test_processed$comb08
+      ))
+    }
+    
+    if (entry$type == "pls") {
+      pls_object <- entry$object
+      pls_model <- if (inherits(pls_object, "mvr")) pls_object else pls_object$model
+      pls_ncomp <- if (inherits(pls_object, "mvr")) 3 else pls_object$ncomp
+      
+      pls_pred <- predict(
+        pls_model,
+        newdata = test_processed,
+        ncomp = pls_ncomp
+      )[, , 1]
+      
+      return(tibble(
+        .pred = as.numeric(pls_pred),
+        comb08 = test_processed$comb08
+      ))
+    }
+    
+    predict(entry$object, test_data) %>%
+      bind_cols(tibble(comb08 = test_data$comb08))
+  }
+  
   pretrained_preds <- reactive({
     req(input$pretrained_model)
-    fit <- pretrained_models[[input$pretrained_model]]
-    req(fit)
-    predict(fit, test_data) %>%
-      bind_cols(tibble(comb08 = test_data$comb08))
+    entry <- pretrained_models[[input$pretrained_model]]
+    req(entry)
+    predict_pretrained(entry)
   })
   
   output$pretrained_metrics <- renderTable({
@@ -402,7 +496,9 @@ server <- function(input, output, session) {
   })
   
   output$pretrained_importance <- renderPlot({
-    fit <- pretrained_models[[input$pretrained_model]]
+    entry <- pretrained_models[[input$pretrained_model]]
+    req(entry)
+    fit <- entry$object
     req(fit)
     tryCatch({
       fit %>%
@@ -422,6 +518,7 @@ server <- function(input, output, session) {
       model_type    = input$model_type,
       feature_space = input$feature_space,
       penalty       = input$penalty,
+      mixture       = input$mixture,
       trees         = input$trees,
       mtry          = input$mtry,
       n_comp        = input$n_comp,
@@ -461,6 +558,7 @@ server <- function(input, output, session) {
                      lm    = linear_reg() %>% set_engine("lm"),
                      lasso = linear_reg(penalty = params$penalty, mixture = 1) %>% set_engine("glmnet"),
                      ridge = linear_reg(penalty = params$penalty, mixture = 0) %>% set_engine("glmnet"),
+                     elastic_net = linear_reg(penalty = params$penalty, mixture = params$mixture) %>% set_engine("glmnet"),
                      rf  = rand_forest(trees = params$trees, mtry = params$mtry,
                                        min_n = params$min_n_rf) %>%
                        set_mode("regression") %>%
@@ -593,6 +691,12 @@ server <- function(input, output, session) {
   
   # ── Correlation matrix ───────────────────────────────────────────────
   output$eda_correlation <- renderPlot({
+    if (is.null(cor_matrix)) {
+      plot.new()
+      text(0.5, 0.5, "Correlation matrix file not found. Run the export chunk in project.Rmd.", cex = 1.1)
+      return()
+    }
+    
     ggcorrplot(cor_matrix)
   })
 }
