@@ -11,7 +11,7 @@ library(vip)
 library(ggcorrplot)
 library(shinydashboard)
 
-# ── VALIDÁCIA STĹPCOV ─────────────────────────────────────────────────
+# ── COLUMN VALIDATION ─────────────────────────────────────────────────
 required_cols <- c(
   "fuelType", "fuelType1", "displ", "cylinders", "trany",
   "drive", "VClass", "year", "make", "comb08"
@@ -27,7 +27,6 @@ validate_columns <- function(data) {
     errors <- c(errors, paste("Missing required columns:", paste(missing, collapse = ", ")))
   }
   if (length(extra) > 0) {
-    # extra stĺpce nie sú chyba – len upozornenie
     warning(paste("Extra columns (will be ignored):", paste(extra, collapse = ", ")))
   }
   
@@ -124,7 +123,6 @@ clean_recipe <- recipe(comb08 ~ ., data = train_data) %>%
   step_normalize(all_numeric_predictors())
 
 # ── LOAD PRE-TRAINED MODELS ───────────────────────────────────────────
-# Ak modely existujú, načítaj ich; inak nastav NULL
 load_model_safe <- function(path) {
   if (file.exists(path)) readRDS(path) else NULL
 }
@@ -135,7 +133,7 @@ pretrained_models <- list(
   "KNN"                 = load_model_safe("models/knn_final.rds"),
   "Random forest + PCA" = load_model_safe("models/pca_rf_final.rds")
 )
-# Odstráň NULL modely (ktoré ešte neboli natrénované)
+
 pretrained_models <- Filter(Negate(is.null), pretrained_models)
 cor_matrix <- readRDS("models/cor_matrix.rds")
 
@@ -158,9 +156,11 @@ ui <- fluidPage(
                )
              ),
              hr(),
+             h3("Basic info about the default dataset"),
+             hr(),
              
              # ── Basic info ──
-             h4("Dataset overview after preprocessing"),
+             h4("Dataset overview before encoding"),
              fluidRow(
                column(3, valueBoxOutput("n_rows",    width = 12)),
                column(3, valueBoxOutput("n_cols",    width = 12)),
@@ -170,7 +170,7 @@ ui <- fluidPage(
              hr(),
              
              # ── Data preview ──
-             h4("Data preview after preprocessing"),
+             h4("Data preview before encoding"),
              tableOutput("data_preview"),
              hr(),
              
@@ -221,7 +221,7 @@ ui <- fluidPage(
     ),
     
     # ════════════════════════════════════════════════════
-    # TAB 3: Custom Model (auto-update)
+    # TAB 3: Custom Model
     # ════════════════════════════════════════════════════
     tabPanel("Custom model",
              br(),
@@ -323,7 +323,7 @@ server <- function(input, output, session) {
   options(shiny.maxRequestSize = 200 * 1024^2)
   
   # ── Data loading ────────────────────────────────────────────────────
-  data_r <- reactiveVal(head(vehicles_model, 100))  # default preview
+  data_r <- reactiveVal(head(vehicles_model, 10))  # default preview
   
   observeEvent(input$load_default, {
     data_r(vehicles_model)
@@ -407,7 +407,7 @@ server <- function(input, output, session) {
     tryCatch({
       fit %>%
         extract_fit_parsnip() %>%
-        vip::vip(num_features = 15) +
+        vip(num_features = 15) +
         labs(title = paste("Feature importance –", input$pretrained_model)) +
         theme_minimal()
     }, error = function(e) {
@@ -416,7 +416,7 @@ server <- function(input, output, session) {
     })
   })
   
-  # ── Custom model (auto-update with debounce) ─────────────────────────
+  # ── Custom model ─────────────────────────
   model_inputs <- reactive({
     list(
       model_type    = input$model_type,
@@ -435,7 +435,7 @@ server <- function(input, output, session) {
     )
   })
   
-  # Čaká 1.5s po poslednej zmene pred refitovaním
+  # waits 1.5s after last change before fitting
   model_inputs_d <- debounce(model_inputs, 1500)
   
   training_running <- reactiveVal(FALSE)
@@ -537,7 +537,7 @@ server <- function(input, output, session) {
     tryCatch({
       model_results()$fit %>%
         extract_fit_parsnip() %>%
-        vip::vip(num_features = 15) +
+        vip(num_features = 15) +
         theme_minimal()
     }, error = function(e) {
       plot.new()

@@ -19,7 +19,7 @@ We formulate the following hypothesis:
 
 **Fuel economy can be accurately predicted based on vehicle characteristics, such as engine specifications, transmission type, vehicle size and other attributes.**
 
-We test this hypothesis by applying a range of regression models, evaluating their predictive performance, and comparing their ability to capture patterns in the data. To investigate this problem, we focus on **Scenario 2** and **Scenario 3**. We also include Scenario 5, although it is not a primary focus, as the dataset is not highly multidimensional (23 features after preprocessing).
+We test this hypothesis by applying a range of regression models, evaluating their predictive performance, and comparing their ability to capture patterns in the data. To investigate this problem, we focus on **Scenario 2** and **Scenario 3**. We also include Scenario 5, although it is not a primary focus, as the dataset is not highly multidimensional (22 features and 1 target variable after preprocessing).
 
 # EDA
 
@@ -1255,8 +1255,6 @@ tune_ctrl <- control_grid(
   save_workflow = TRUE,
   verbose      = TRUE
 )
-
-metrics_set <- metric_set(rmse, rsq, mae)
 ```
 
 #### Decision tree
@@ -1289,7 +1287,7 @@ dt_tune <- tune_grid(
   dt_wf,
   resamples = folds,
   grid      = dt_grid,
-  metrics   = metrics_set,
+  metrics   = eval_metrics,
   control   = tune_ctrl
 )
 ```
@@ -1414,7 +1412,7 @@ rf_tuned <- tune_grid(
   rf_workflow,
   resamples = folds,
   grid = rf_grid,
-  metrics   = metrics_set,
+  metrics   = eval_metrics,
   control   = tune_ctrl
 )
 
@@ -1535,7 +1533,7 @@ knn_tune <- tune_grid(
   knn_wf,
   resamples = folds,
   grid      = knn_grid,
-  metrics   = metrics_set,
+  metrics   = eval_metrics,
   control   = tune_ctrl
 )
 
@@ -2189,7 +2187,7 @@ LASSO is the simpler embedded selector — clean, interpretable, sparse when the
 
 ## Scenario 5: Dimensionality Reduction
 
-This scenario was not the primary focus of our analysis, as the dataset is not highly multidimensional. After preprocessing, the data contains 23 features, which does not typically require dimensionality reduction techniques. Nevertheless, we included it to explore dimensionality reduction techniques such as PCA and to assess their effect on model performance, interpretability and information loss.
+This scenario was not the primary focus of our analysis, as the dataset is not highly multidimensional. After preprocessing, the data contains 22 features and 1 target variable, which does not typically require dimensionality reduction techniques. Nevertheless, we included it to explore dimensionality reduction techniques such as PCA and to assess their effect on model performance, interpretability and information loss.
 
 ### Principal Component Analysis (PCA)
 
@@ -2270,10 +2268,10 @@ p2 <- cum_var %>%
   geom_hline(yintercept = c(0.80, 0.90, 0.95),
              linetype = "dashed",
              color = c("orange", "red", "darkred")) +
-  annotate("text", x = 22, y = 0.81, label = "80%", color = "orange",    size = 3) +
-  annotate("text", x = 22, y = 0.91, label = "90%", color = "red",       size = 3) +
-  annotate("text", x = 22, y = 0.96, label = "95%", color = "darkred",   size = 3) +
-  scale_x_continuous(breaks = seq(0, 23, 5)) +
+  annotate("text", x = 21, y = 0.81, label = "80%", color = "orange",    size = 3) +
+  annotate("text", x = 21, y = 0.91, label = "90%", color = "red",       size = 3) +
+  annotate("text", x = 2, y = 0.96, label = "95%", color = "darkred",   size = 3) +
+  scale_x_continuous(breaks = seq(0, 22, 5)) +
   labs(
     title = "Cummulative explained variability",
     x     = "Number of principal components",
@@ -2339,7 +2337,7 @@ pca_rf_tuned <- tune_grid(
   pca_rf_workflow,
   resamples = folds,
   grid = pca_rf_grid,
-  metrics   = metrics_set,
+  metrics   = eval_metrics,
   control   = tune_ctrl
 )
 
@@ -2696,5 +2694,4 @@ saveRDS(knn_final,    "models/knn_final.rds")
 saveRDS(pca_rf_final, "models/pca_rf_final.rds")
 
 saveRDS(cor_matrix, "models/cor_matrix.rds")
-
 ```
